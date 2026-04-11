@@ -60,7 +60,15 @@ fn flag_pair(positive: bool, negative: bool) -> Option<bool> {
 fn main() {
     let args = Cli::parse();
 
-    let all = args.all;
+    let all = if args.stack {
+        false
+    } else if args.all {
+        true
+    } else {
+        // Default: sync current stack only
+        // (may be overridden by config in the future)
+        false
+    };
 
     let opts = sync::SyncOptions {
         fetch: flag_pair(args.fetch, args.no_fetch).unwrap_or(false),
