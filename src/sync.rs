@@ -220,7 +220,7 @@ fn parse_stack_file(
         let indent = if raw_line.starts_with('\t') {
             raw_line.len() - raw_line.trim_start_matches('\t').len()
         } else {
-            // Accept any consistent spacing — treat each group as one level
+            // Count raw leading whitespace chars — works with consistent spacing
             raw_line.len() - raw_line.trim_start().len()
         };
 
@@ -775,7 +775,7 @@ pub fn handle_sync(opts: SyncOptions) -> anyhow::Result<()> {
                 );
                 // Save fork-points for branches processed so far
                 save_fork_points(&repo, &fork_points)?;
-                bail!("rebase conflict — resolve and re-run `wt sync`");
+                std::process::exit(1);
             }
             return Err(e.context(format!("Failed to rebase {branch} onto {parent}")));
         }
