@@ -774,8 +774,8 @@ pub fn handle_sync(opts: SyncOptions) -> anyhow::Result<()> {
                     ))
                 );
                 // Save fork-points for branches processed so far
-                let _ = save_fork_points(&repo, &fork_points);
-                return Ok(());
+                save_fork_points(&repo, &fork_points)?;
+                bail!("rebase conflict — resolve and re-run `wt sync`");
             }
             return Err(e.context(format!("Failed to rebase {branch} onto {parent}")));
         }
