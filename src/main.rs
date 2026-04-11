@@ -1,4 +1,5 @@
-use clap::Parser;
+use clap::{CommandFactory, Parser};
+use clap_complete::env::CompleteEnv;
 
 mod sync;
 
@@ -66,6 +67,8 @@ fn flag_pair(positive: bool, negative: bool) -> Option<bool> {
 }
 
 fn main() {
+    CompleteEnv::with_factory(Cli::command).complete();
+
     let args = Cli::parse();
 
     let all = if args.stack {
