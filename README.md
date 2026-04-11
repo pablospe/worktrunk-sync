@@ -52,6 +52,7 @@ This fetches from the remote, rebases branches in the current stack, pushes the 
 | `--fetch` | Fetch from remote before syncing |
 | `--push` | Push rebased branches after syncing |
 | `--prune` | Remove integrated worktrees after syncing |
+| `--force` | Force removal of dirty integrated worktrees (with `--prune`) |
 | `--dry-run` | Preview the sync plan without executing |
 
 ## Example

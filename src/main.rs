@@ -44,6 +44,10 @@ struct Cli {
     #[arg(long = "no-prune", overrides_with = "prune", hide = true)]
     no_prune: bool,
 
+    /// Force removal of dirty integrated worktrees (with --prune)
+    #[arg(long)]
+    force: bool,
+
     /// Preview the sync plan without executing
     #[arg(long)]
     dry_run: bool,
@@ -75,6 +79,7 @@ fn main() {
         all,
         push: flag_pair(args.push, args.no_push).unwrap_or(false),
         prune: flag_pair(args.prune, args.no_prune).unwrap_or(false),
+        force: args.force,
         dry_run: args.dry_run,
     };
 

@@ -136,6 +136,7 @@ pub struct SyncOptions {
     pub all: bool,
     pub push: bool,
     pub prune: bool,
+    pub force: bool,
     pub dry_run: bool,
 }
 
@@ -856,8 +857,11 @@ pub fn handle_sync(opts: SyncOptions) -> anyhow::Result<()> {
                 .branch(branch)
                 .push_remote()
                 .unwrap_or_else(|| "origin".to_string());
-            // Remove worktree (without --force to avoid silent data loss)
-            let result = repo.run_command(&["worktree", "remove", &path.to_string_lossy()]);
+            let result = if opts.force {
+                repo.run_command(&["worktree", "remove", "--force", &path.to_string_lossy()])
+            } else {
+                repo.run_command(&["worktree", "remove", &path.to_string_lossy()])
+            };
             if let Err(e) = result {
                 eprintln!(
                     "{}",
