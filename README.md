@@ -53,6 +53,7 @@ This fetches from the remote, rebases branches in the current stack, pushes the 
 | `--push` | `-p` | Push rebased branches after syncing |
 | `--prune` | `-P` | Remove integrated worktrees after syncing |
 | `--force` | `-F` | Force removal of dirty integrated worktrees (with `--prune`) |
+| `--verbose` | `-v` | Show git commands that would be executed |
 | `--dry-run` | `-n` | Preview the sync plan without executing |
 
 ## Example

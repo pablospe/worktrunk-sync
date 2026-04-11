@@ -137,6 +137,7 @@ pub struct SyncOptions {
     pub push: bool,
     pub prune: bool,
     pub force: bool,
+    pub verbose: bool,
     pub dry_run: bool,
 }
 
@@ -607,7 +608,7 @@ pub fn handle_sync(opts: SyncOptions) -> anyhow::Result<()> {
     // Fetch from remote if requested
     if opts.fetch {
         eprintln!("{}", progress_message(cformat!("Fetching from remote...")));
-        repo.run_command(&["fetch", "--prune"])
+        repo.run_command(&["fetch"])
             .context("git fetch failed")?;
         eprintln!("{}", success_message("Fetch complete"));
     }
@@ -645,7 +646,7 @@ pub fn handle_sync(opts: SyncOptions) -> anyhow::Result<()> {
 
     // Dry-run mode: show plan and exit
     if opts.dry_run {
-        print_sync_plan(&tree, &branches_to_sync);
+        print_sync_plan(&repo, &tree, &branches_to_sync, &integrated, &opts);
         return Ok(());
     }
 
@@ -912,9 +913,17 @@ pub fn handle_sync(opts: SyncOptions) -> anyhow::Result<()> {
 }
 
 /// Print the sync plan (dry-run mode).
-fn print_sync_plan(tree: &DependencyTree, branches: &[&str]) {
+fn print_sync_plan(
+    repo: &Repository,
+    tree: &DependencyTree,
+    branches: &[&str],
+    integrated: &[(String, PathBuf)],
+    opts: &SyncOptions,
+) {
     eprintln!("Dependency tree:");
     print_tree_node(tree, &tree.root, "", true, true);
+
+    let fork_points = load_fork_points(repo);
 
     eprintln!();
     eprintln!("Planned operations:");
@@ -931,13 +940,54 @@ fn print_sync_plan(tree: &DependencyTree, branches: &[&str]) {
             eprintln!(
                 "  rebase --onto {parent} {orig_parent} {branch}  (reparented from integrated {orig_parent})"
             );
+            if opts.verbose {
+                eprintln!("    $ git rebase --onto {parent} {orig_parent} {branch}");
+            }
         } else {
             eprintln!("  rebase {branch} onto {parent}");
+            if opts.verbose {
+                let base = fork_points
+                    .get(branch)
+                    .map(|s| s.as_str())
+                    .unwrap_or("<merge-base>");
+                eprintln!("    $ git rebase --onto {parent} {base} {branch}");
+            }
         }
         has_ops = true;
     }
     if !has_ops {
         eprintln!("  (none)");
+    }
+
+    if opts.verbose {
+        if opts.fetch {
+            eprintln!();
+            eprintln!("Fetch:");
+            eprintln!("    $ git fetch");
+        }
+        if opts.push {
+            eprintln!();
+            eprintln!("Push:");
+            for &branch in branches {
+                let remote = repo
+                    .branch(branch)
+                    .push_remote()
+                    .unwrap_or_else(|| "origin".to_string());
+                eprintln!("    $ git push --force-with-lease {remote} {branch}");
+            }
+        }
+        if opts.prune && !integrated.is_empty() {
+            eprintln!();
+            eprintln!("Prune:");
+            for (branch, path) in integrated {
+                let force_flag = if opts.force { " --force" } else { "" };
+                eprintln!(
+                    "    $ git worktree remove{force_flag} {}",
+                    path.to_string_lossy()
+                );
+                eprintln!("    $ git branch -D {branch}");
+            }
+        }
     }
 }
 

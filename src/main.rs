@@ -48,6 +48,10 @@ struct Cli {
     #[arg(short = 'F', long)]
     force: bool,
 
+    /// Show git commands that would be executed
+    #[arg(short, long)]
+    verbose: bool,
+
     /// Preview the sync plan without executing
     #[arg(short = 'n', long)]
     dry_run: bool,
@@ -80,6 +84,7 @@ fn main() {
         push: flag_pair(args.push, args.no_push).unwrap_or(false),
         prune: flag_pair(args.prune, args.no_prune).unwrap_or(false),
         force: args.force,
+        verbose: args.verbose,
         dry_run: args.dry_run,
     };
 
