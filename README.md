@@ -2,7 +2,7 @@
 
 Rebase stacked worktree branches in dependency order.
 
-An external subcommand for [worktrunk](https://github.com/max-sixty/worktrunk) — run it as `wt sync`.
+Works with any git worktrees — no special setup required. Can also be used as an external subcommand for [worktrunk](https://github.com/max-sixty/worktrunk) via `wt sync`.
 
 ## How it works
 
@@ -25,14 +25,18 @@ Both files are auto-created and updated on every sync.
 cargo install worktrunk-sync
 ```
 
-The binary is named `wt-sync`, which worktrunk discovers automatically via [external subcommand dispatch](https://github.com/max-sixty/worktrunk/pull/2054).
+The binary is named `wt-sync` and can be run directly. If [worktrunk](https://github.com/max-sixty/worktrunk) is installed, it also works as `wt sync` via [external subcommand dispatch](https://github.com/max-sixty/worktrunk/pull/2054).
 
 ## Usage
 
 ```bash
-wt sync              # sync the current stack (default)
-wt sync --all        # sync all stacks
-wt sync --dry-run    # preview the plan without executing
+wt-sync              # sync the current stack (default)
+wt-sync --all        # sync all stacks
+wt-sync -nv          # preview the plan with git commands
+
+# Or via worktrunk:
+wt sync
+wt sync --all
 ```
 
 ### Full workflow
@@ -59,17 +63,20 @@ This fetches from the remote, rebases branches in the current stack, pushes the 
 ## Example
 
 ```
-$ wt sync --dry-run
+$ wt-sync -nv
 Dependency tree:
-  main
-    feature-a
-      feature-b
-    feature-c
+main
+├── feature-a
+│   └── feature-b
+└── feature-c
 
-Sync plan:
-  1. Rebase feature-a onto main
-  2. Rebase feature-b onto feature-a
-  3. Rebase feature-c onto main
+Planned operations:
+  rebase feature-a onto main
+    $ git rebase --onto main abc1234 feature-a
+  rebase feature-b onto feature-a
+    $ git rebase --onto feature-a def5678 feature-b
+  rebase feature-c onto main
+    $ git rebase --onto main abc1234 feature-c
 ```
 
 ## Key behaviors
@@ -82,8 +89,8 @@ Sync plan:
 
 ## Requirements
 
-- [worktrunk](https://github.com/max-sixty/worktrunk) >= 0.35
-- Git
+- Git with worktrees (`git worktree add`)
+- [worktrunk](https://github.com/max-sixty/worktrunk) >= 0.35 (runtime dependency for repository utilities)
 
 ## License
 
