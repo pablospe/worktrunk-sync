@@ -10,18 +10,18 @@ mod sync;
 #[command(name = "wt-sync", version)]
 struct Cli {
     /// Only sync the current stack (default)
-    #[arg(long, overrides_with = "all")]
+    #[arg(short, long, overrides_with = "all")]
     stack: bool,
 
     /// Sync all stacks
     ///
     /// By default, only the stack containing the current branch is synced.
     /// With `--all`, every worktree branch is synced.
-    #[arg(long, overrides_with = "stack")]
+    #[arg(short, long, overrides_with = "stack")]
     all: bool,
 
     /// Fetch from remote before syncing
-    #[arg(long, overrides_with = "no_fetch")]
+    #[arg(short, long, overrides_with = "no_fetch")]
     fetch: bool,
 
     /// Don't fetch from remote
@@ -29,7 +29,7 @@ struct Cli {
     no_fetch: bool,
 
     /// Push rebased branches after syncing
-    #[arg(long, overrides_with = "no_push")]
+    #[arg(short, long, overrides_with = "no_push")]
     push: bool,
 
     /// Don't push after syncing
@@ -37,7 +37,7 @@ struct Cli {
     no_push: bool,
 
     /// Remove integrated worktrees after syncing
-    #[arg(long, overrides_with = "no_prune")]
+    #[arg(short = 'P', long, overrides_with = "no_prune")]
     prune: bool,
 
     /// Don't remove integrated worktrees
@@ -45,11 +45,11 @@ struct Cli {
     no_prune: bool,
 
     /// Force removal of dirty integrated worktrees (with --prune)
-    #[arg(long)]
+    #[arg(short = 'F', long)]
     force: bool,
 
     /// Preview the sync plan without executing
-    #[arg(long)]
+    #[arg(short = 'n', long)]
     dry_run: bool,
 }
 

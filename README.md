@@ -45,15 +45,15 @@ This fetches from the remote, rebases branches in the current stack, pushes the 
 
 ### Flags
 
-| Flag | Description |
-|------|-------------|
-| `--stack` | Sync only the current stack (default) |
-| `--all` | Sync all stacks |
-| `--fetch` | Fetch from remote before syncing |
-| `--push` | Push rebased branches after syncing |
-| `--prune` | Remove integrated worktrees after syncing |
-| `--force` | Force removal of dirty integrated worktrees (with `--prune`) |
-| `--dry-run` | Preview the sync plan without executing |
+| Flag | Short | Description |
+|------|-------|-------------|
+| `--stack` | `-s` | Sync only the current stack (default) |
+| `--all` | `-a` | Sync all stacks |
+| `--fetch` | `-f` | Fetch from remote before syncing |
+| `--push` | `-p` | Push rebased branches after syncing |
+| `--prune` | `-P` | Remove integrated worktrees after syncing |
+| `--force` | `-F` | Force removal of dirty integrated worktrees (with `--prune`) |
+| `--dry-run` | `-n` | Preview the sync plan without executing |
 
 ## Example
 
