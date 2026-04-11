@@ -218,7 +218,7 @@ fn parse_stack_file(
             continue;
         };
 
-        // Determine indent level (count leading whitespace: tab=1, space groups of 4=1)
+        // Determine indent level (tabs counted individually, spaces by raw count)
         let indent = if raw_line.starts_with('\t') {
             raw_line.len() - raw_line.trim_start_matches('\t').len()
         } else {
@@ -605,8 +605,8 @@ fn build_dependency_tree(
 pub fn handle_sync(opts: SyncOptions) -> anyhow::Result<()> {
     let repo = Repository::current()?;
 
-    // Fetch from remote if requested
-    if opts.fetch {
+    // Fetch from remote if requested (skip in dry-run)
+    if opts.fetch && !opts.dry_run {
         eprintln!("{}", progress_message(cformat!("Fetching from remote...")));
         repo.run_command(&["fetch"])
             .context("git fetch failed")?;
@@ -966,26 +966,41 @@ fn print_sync_plan(
             eprintln!("    $ git fetch");
         }
         if opts.push {
-            eprintln!();
-            eprintln!("Push:");
-            for &branch in branches {
-                let remote = repo
-                    .branch(branch)
-                    .push_remote()
-                    .unwrap_or_else(|| "origin".to_string());
-                eprintln!("    $ git push --force-with-lease {remote} {branch}");
+            let pushable: Vec<&str> = branches
+                .iter()
+                .filter(|b| repo.branch(b).upstream().ok().flatten().is_some())
+                .copied()
+                .collect();
+            if !pushable.is_empty() {
+                eprintln!();
+                eprintln!("Push:");
+                for branch in &pushable {
+                    let remote = repo
+                        .branch(branch)
+                        .push_remote()
+                        .unwrap_or_else(|| "origin".to_string());
+                    eprintln!("    $ git push --force-with-lease {remote} {branch}");
+                }
             }
         }
         if opts.prune && !integrated.is_empty() {
             eprintln!();
             eprintln!("Prune:");
             for (branch, path) in integrated {
+                let has_upstream = repo.branch(branch).upstream().ok().flatten().is_some();
+                let prune_remote = repo
+                    .branch(branch)
+                    .push_remote()
+                    .unwrap_or_else(|| "origin".to_string());
                 let force_flag = if opts.force { " --force" } else { "" };
                 eprintln!(
                     "    $ git worktree remove{force_flag} {}",
                     path.to_string_lossy()
                 );
                 eprintln!("    $ git branch -D {branch}");
+                if has_upstream {
+                    eprintln!("    $ git push {prune_remote} --delete {branch}");
+                }
             }
         }
     }
