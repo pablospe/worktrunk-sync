@@ -9,14 +9,14 @@ mod sync;
 #[derive(Parser)]
 #[command(name = "wt-sync", version)]
 struct Cli {
-    /// Only sync the current stack
-    ///
-    /// Without this flag, all worktree branches are synced. With `--stack`, only
-    /// the stack containing the current branch is synced.
-    #[arg(long)]
+    /// Only sync the current stack (default)
+    #[arg(long, overrides_with = "all")]
     stack: bool,
 
     /// Sync all stacks
+    ///
+    /// By default, only the stack containing the current branch is synced.
+    /// With `--all`, every worktree branch is synced.
     #[arg(long, overrides_with = "stack")]
     all: bool,
 
@@ -60,13 +60,11 @@ fn flag_pair(positive: bool, negative: bool) -> Option<bool> {
 fn main() {
     let args = Cli::parse();
 
-    let all = if args.stack {
-        false
-    } else if args.all {
+    let all = if args.all {
         true
     } else {
-        // Default: sync all
-        true
+        // Default: sync current stack only
+        false
     };
 
     let opts = sync::SyncOptions {

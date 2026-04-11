@@ -24,8 +24,8 @@ The binary is named `wt-sync`, which worktrunk discovers automatically via [exte
 ## Usage
 
 ```bash
-wt sync              # sync all stacks (default)
-wt sync --stack      # sync only the current stack
+wt sync              # sync the current stack (default)
+wt sync --all        # sync all stacks
 wt sync --dry-run    # preview the plan without executing
 ```
 
@@ -33,8 +33,8 @@ wt sync --dry-run    # preview the plan without executing
 
 | Flag | Description |
 |------|-------------|
-| `--stack` | Only sync the stack containing the current branch |
-| `--all` | Sync all stacks (default) |
+| `--stack` | Only sync the current stack (default) |
+| `--all` | Sync all stacks |
 | `--fetch` | Fetch from remote before syncing |
 | `--push` | Push rebased branches after syncing |
 | `--prune` | Remove integrated worktrees after syncing |
