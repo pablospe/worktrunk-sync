@@ -920,6 +920,12 @@ fn print_sync_plan(
     integrated: &[(String, PathBuf)],
     opts: &SyncOptions,
 ) {
+    if opts.verbose && opts.fetch {
+        eprintln!("Fetch:");
+        eprintln!("    $ git fetch");
+        eprintln!();
+    }
+
     eprintln!("Dependency tree:");
     print_tree_node(tree, &tree.root, "", true, true);
 
@@ -960,11 +966,6 @@ fn print_sync_plan(
     }
 
     if opts.verbose {
-        if opts.fetch {
-            eprintln!();
-            eprintln!("Fetch:");
-            eprintln!("    $ git fetch");
-        }
         if opts.push {
             let pushable: Vec<&str> = branches
                 .iter()

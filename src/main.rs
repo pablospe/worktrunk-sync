@@ -45,7 +45,7 @@ struct Cli {
     no_prune: bool,
 
     /// Force removal of dirty integrated worktrees (with --prune)
-    #[arg(short = 'F', long)]
+    #[arg(short = 'F', long, requires = "prune")]
     force: bool,
 
     /// Show git commands that would be executed
