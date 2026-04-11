@@ -6,12 +6,18 @@ An external subcommand for [worktrunk](https://github.com/max-sixty/worktrunk) �
 
 ## How it works
 
-`wt sync` detects the branch dependency tree from git's commit graph using pairwise merge-base analysis, then rebases each branch onto its parent in topological order. All rebases use `--onto` with a stored fork-point, which correctly handles parent branches that have been rewritten (rebased, amended, or force-pushed).
+`wt sync` detects the branch dependency tree from git's commit graph using pairwise merge-base analysis, then rebases each branch onto its parent in topological order.
 
-Two files are persisted to `.git/wt/`:
+All rebases use `--onto` with a stored fork-point, so parent branches that have been rewritten (rebased, amended, or force-pushed) are handled correctly — no duplicate commits or spurious conflicts.
+
+### Persisted state
+
+Two files are stored in `.git/wt/` (shared across all worktrees):
 
 - **`stack`** — the dependency tree in [git-machete](https://github.com/VirtusLab/git-machete) compatible format, used for parent tracking and integration detection.
-- **`stack-forkpoints`** — each branch's parent SHA at last sync, used as the `--onto` base.
+- **`stack-forkpoints`** — each branch's parent SHA at last sync, used as the `--onto` base for the next rebase.
+
+Both files are auto-created and updated on every sync.
 
 ## Install
 
@@ -29,11 +35,19 @@ wt sync --all        # sync all stacks
 wt sync --dry-run    # preview the plan without executing
 ```
 
+### Full workflow
+
+```bash
+wt sync --fetch --push --prune
+```
+
+This fetches from the remote, rebases all branches in order, pushes the rebased branches, and removes any worktrees whose branches have been merged.
+
 ### Flags
 
 | Flag | Description |
 |------|-------------|
-| `--stack` | Only sync the current stack (default) |
+| `--stack` | Sync only the current stack (default) |
 | `--all` | Sync all stacks |
 | `--fetch` | Fetch from remote before syncing |
 | `--push` | Push rebased branches after syncing |
@@ -59,9 +73,10 @@ Sync plan:
 ## Key behaviors
 
 - **Zero configuration** — dependencies are inferred from git history
-- **Stack file auto-managed** — created and updated on every sync
-- **Conflict handling** — stops on first conflict; resolve and re-run `wt sync`
-- **Integrated branch detection** — branches merged into their parent are detected and their children reparented
+- **Fork-point tracking** — stores the parent SHA at each sync so `--onto` rebases work correctly even after the parent is rewritten
+- **Integrated branch detection** — branches merged into their parent (or into the default branch) are detected; their children are reparented automatically
+- **Conflict handling** — stops on first conflict with instructions to resolve; fork-points for already-rebased branches are saved so re-running `wt sync` picks up where it left off
+- **Non-zero exit on conflict** — so `wt sync && wt sync --push` won't silently push past a conflict
 
 ## Requirements
 

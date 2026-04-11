@@ -17,8 +17,8 @@
 //! Key behaviors:
 //! - No configuration needed — dependencies are inferred from git history
 //! - Stack file is auto-created and updated on every sync
-//! - By default, syncs all stacks
-//! - `--stack` restricts to the stack containing the current branch
+//! - By default, syncs only the current stack
+//! - `--all` syncs every worktree branch
 //! - `--dry-run` previews the plan without executing
 //! - Stops on first conflict; user resolves and re-runs
 
