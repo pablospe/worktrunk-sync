@@ -41,7 +41,7 @@ wt sync --dry-run    # preview the plan without executing
 wt sync --fetch --push --prune
 ```
 
-This fetches from the remote, rebases all branches in order, pushes the rebased branches, and removes any worktrees whose branches have been merged.
+This fetches from the remote, rebases branches in the current stack, pushes the rebased branches, and removes any worktrees whose branches have been merged.
 
 ### Flags
 
