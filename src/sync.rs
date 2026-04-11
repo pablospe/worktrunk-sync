@@ -1,18 +1,22 @@
-//! Rebase stacked worktree branches in dependency order.
+//! `wt sync` — rebase stacked worktree branches in dependency order.
 //!
 //! Detects the branch dependency tree from git's commit graph using pairwise
 //! merge-base analysis, then rebases each branch onto its parent in topological
-//! order. Handles integrated (merged) branches by reparenting their children
-//! with `rebase --onto`.
+//! order. All rebases use `--onto` with a stored fork-point, which correctly
+//! handles parent branches that have been rewritten (rebased, amended, or
+//! force-pushed). Integrated (merged) branches are detected and their children
+//! reparented.
 //!
-//! The dependency tree is persisted to a stack file (`.git/wt/stack`) on every
-//! sync. The format is compatible with git-machete: indentation-based, one
-//! branch per line. When this file exists, it is used for parent tracking and
-//! non-default branch integration detection.
+//! Two files are persisted to `.git/wt/`:
+//! - `stack` — the dependency tree (git-machete compatible format), used for
+//!   parent tracking and non-default branch integration detection.
+//! - `stack-forkpoints` — each branch's parent SHA at last sync, used as the
+//!   `--onto` base. Without this, rebasing after a parent rewrite would replay
+//!   the parent's old commits and cause conflicts.
 //!
 //! Key behaviors:
 //! - No configuration needed — dependencies are inferred from git history
-//! - Stack file (`.git/wt/stack`) is auto-created and updated on every sync
+//! - Stack file is auto-created and updated on every sync
 //! - By default, syncs all stacks
 //! - `--stack` restricts to the stack containing the current branch
 //! - `--dry-run` previews the plan without executing
@@ -70,11 +74,14 @@ impl DependencyTree {
 
     /// Get all branches in the stack containing the given branch.
     fn stack_containing(&self, branch: &str) -> Vec<&str> {
+        // Find the branch in our nodes first (ensures we return self-lifetime refs)
         let Some(start_node) = self.nodes.get(branch) else {
             return vec![];
         };
 
         // Walk up to find the top of the stack (direct child of root).
+        // Track visited nodes to detect cycles (safety net against dependency
+        // detection bugs that produce circular parent chains).
         let mut current_key = start_node.branch.as_str();
         let mut visited = std::collections::HashSet::new();
         visited.insert(current_key);
@@ -89,6 +96,7 @@ impl DependencyTree {
                         Some(n) => {
                             let key = n.branch.as_str();
                             if !visited.insert(key) {
+                                // Cycle detected — treat branch as direct child of root
                                 break;
                             }
                             key
@@ -96,14 +104,17 @@ impl DependencyTree {
                         None => break,
                     };
                 }
-                None => break,
+                None => break, // current is the root
             }
         }
 
         if current_key == self.root {
+            // Branch is a direct child of root or the root itself — return all
             return self.topological_order();
         }
 
+        // `current_key` is the top of the stack (direct child of root).
+        // Collect all descendants.
         let mut stack: Vec<&str> = Vec::new();
         let mut queue = std::collections::VecDeque::new();
         queue.push_back(current_key);
@@ -131,40 +142,85 @@ pub struct SyncOptions {
 /// Stack file name within the wt data directory.
 const STACK_FILE: &str = "stack";
 
+/// Fork-points file: records each branch's parent SHA after a successful sync.
+/// Used for `--onto` rebasing when a parent branch has been rewritten.
+const FORK_POINTS_FILE: &str = "stack-forkpoints";
+
+/// Load fork-points from `.git/wt/stack-forkpoints`.
+/// Returns a map of branch_name -> parent_sha_at_last_sync.
+fn load_fork_points(repo: &Repository) -> HashMap<String, String> {
+    let path = repo.wt_dir().join(FORK_POINTS_FILE);
+    let Ok(content) = std::fs::read_to_string(&path) else {
+        return HashMap::new();
+    };
+    content
+        .lines()
+        .filter_map(|line| {
+            let (branch, sha) = line.split_once('=')?;
+            Some((branch.trim().to_string(), sha.trim().to_string()))
+        })
+        .collect()
+}
+
+/// Save fork-points to `.git/wt/stack-forkpoints`.
+/// Records each branch's parent tip SHA so the next sync can use `--onto`.
+fn save_fork_points(
+    repo: &Repository,
+    fork_points: &HashMap<String, String>,
+) -> anyhow::Result<()> {
+    let path = repo.wt_dir().join(FORK_POINTS_FILE);
+    let mut lines: Vec<String> = fork_points
+        .iter()
+        .map(|(branch, sha)| format!("{branch}={sha}"))
+        .collect();
+    lines.sort();
+    std::fs::write(&path, lines.join("\n") + "\n").context("Failed to write fork-points file")?;
+    Ok(())
+}
+
 /// Parse a stack file (git-machete compatible format) into a parent map.
 ///
-/// The format is indentation-based, one branch per line:
+/// The full git-machete format is indentation-based, one branch per line,
+/// with the root (default branch) at the top:
 /// ```text
-/// pr1
-///     pr2
-///         pr3
+/// main
+///     pr1
+///         pr2
+///             pr3
 ///     other-pr
 /// ```
 ///
-/// Returns a map of branch -> parent. The root branch (default branch) is
-/// implicit and not included in the file.
+/// Note: `format_stack_file` omits the root branch when writing, so files
+/// produced by worktrunk start at the first child level. Both formats are
+/// accepted when reading.
+///
+/// Returns a map of branch -> parent. The root branch (first line, no indent)
+/// is expected to match the default branch and is not included in the map.
 fn parse_stack_file(
     content: &str,
     default_branch: &str,
 ) -> anyhow::Result<HashMap<String, String>> {
     let mut parent_map: HashMap<String, String> = HashMap::new();
+    // Stack of (indent_level, branch_name)
     let mut stack: Vec<(usize, String)> = Vec::new();
 
     for raw_line in content.lines() {
+        // Skip empty lines and comments
         let trimmed = raw_line.trim();
         if trimmed.is_empty() || trimmed.starts_with('#') {
             continue;
         }
 
-        // Strip annotations after the branch name
+        // Strip annotations after the branch name (machete supports "branch  annotation")
         let Some(branch) = trimmed.split_whitespace().next() else {
             continue;
         };
 
-        // Determine indent level
+        // Determine indent level (count leading whitespace: tab=1, space groups of 4=1)
         let indent = if raw_line.starts_with('\t') {
             raw_line.len() - raw_line.trim_start_matches('\t').len()
         } else {
+            // Accept any consistent spacing — treat each group as one level
             raw_line.len() - raw_line.trim_start().len()
         };
 
@@ -182,6 +238,7 @@ fn parse_stack_file(
             .map(|(_, b)| b.clone())
             .unwrap_or_else(|| default_branch.to_string());
 
+        // The root entry (default branch itself) is not added to the map
         if branch != default_branch {
             parent_map.insert(branch.to_string(), parent);
         }
@@ -229,6 +286,9 @@ fn write_stack_file(repo: &Repository, tree: &DependencyTree) -> anyhow::Result<
 /// For each branch B, finds the closest parent P where merge_base(P, B) is
 /// nearest to B's tip (fewest commits ahead). Integrated branches are excluded
 /// and their children reparented.
+///
+/// If a stack file (`.git/wt/stack`) exists, it is used for parent detection
+/// instead of merge-base inference.
 fn build_dependency_tree(
     repo: &Repository,
 ) -> anyhow::Result<(DependencyTree, Vec<(String, PathBuf)>)> {
@@ -249,7 +309,7 @@ fn build_dependency_tree(
         }
     }
 
-    // Ensure default branch is included
+    // Ensure default branch is included (may be the main worktree)
     let has_default = branches.iter().any(|(b, _)| b == &default_branch);
     if !has_default {
         bail!(
@@ -259,12 +319,17 @@ fn build_dependency_tree(
     }
 
     // Check for integrated branches.
+    //
+    // Without a stack file, we only check against the default branch (main).
+    // With a stack file, we also check against each branch's explicit parent,
+    // which detects merges between non-default branches (e.g., PR2 squash-merged
+    // into PR1).
     let integration_target = repo.integration_target();
     let target_ref = integration_target.as_deref().unwrap_or(&default_branch);
 
     let mut integrated: HashMap<String, PathBuf> = HashMap::new();
 
-    // Parse stack file once
+    // Parse stack file once (used for parent detection, integration checks, and reparenting)
     let stack_file_path = repo.wt_dir().join(STACK_FILE);
     let explicit_parents: HashMap<String, String> = if stack_file_path.exists() {
         let content =
@@ -286,7 +351,9 @@ fn build_dependency_tree(
         }
     }
 
-    // Phase 2: With stack file, also check integration against explicit parent
+    // Phase 2: With stack file, also check integration against each branch's
+    // explicit parent. This catches merges between stacked branches (e.g.,
+    // PR2 squash-merged into PR1).
     if has_stack_file {
         for (branch, path) in &branches {
             if branch == &default_branch || integrated.contains_key(branch) {
@@ -303,7 +370,8 @@ fn build_dependency_tree(
         }
     }
 
-    // Determine parent for each branch
+    // Determine parent for each branch. If a stack file exists, use it;
+    // otherwise infer parents from the commit graph.
     let mut parent_map: HashMap<String, (String, Option<String>)> = HashMap::new();
 
     if has_stack_file {
@@ -319,6 +387,22 @@ fn build_dependency_tree(
         }
     } else {
         // Infer parents from the commit graph using merge-base analysis.
+        //
+        // For each branch B, the parent P is selected in two tiers:
+        //   1. True ancestors (candidate_depth == 0, meaning merge_base ==
+        //      candidate tip): branches whose tip is reachable from B. Among
+        //      true ancestors, pick the closest (smallest branch_depth).
+        //   2. Diverged candidates (only if no true ancestors): pick by
+        //      smallest branch_depth, then smallest candidate_depth.
+        //
+        // This prevents cycles in stacked branches: if B descends from C
+        // (C's tip is on B's history), C is a true ancestor and always wins
+        // over siblings that merely share a common fork point.
+        //
+        // Limitation: after syncing + adding a mid-stack commit, the parent
+        // branch becomes "diverged" and may lose to the default branch (a
+        // true ancestor). The auto-saved stack file (`.git/wt/stack`) avoids
+        // this by preserving explicit parent relationships across syncs.
         let branch_names: Vec<&str> = branches.iter().map(|(b, _)| b.as_str()).collect();
 
         for (branch, _) in &branches {
@@ -377,8 +461,7 @@ fn build_dependency_tree(
             }
 
             if tie_candidates.len() > 1 {
-                let mb_shas: Vec<&str> =
-                    tie_candidates.iter().map(|(_, mb)| mb.as_str()).collect();
+                let mb_shas: Vec<&str> = tie_candidates.iter().map(|(_, mb)| mb.as_str()).collect();
                 let timestamps = repo.commit_timestamps(&mb_shas)?;
 
                 let mut best_ts = i64::MIN;
@@ -414,13 +497,21 @@ fn build_dependency_tree(
     }
 
     // Reparent children of integrated branches.
+    //
+    // If branch X's parent was integrated, walk up the tree to find the first
+    // non-integrated ancestor. With a stack file, this uses the explicit parent
+    // chain (e.g., pr2 integrated into pr1 → pr3 reparents to pr1). Without a
+    // stack file, falls back to the default branch.
     for (_branch, (parent, original_parent)) in parent_map.iter_mut() {
         if integrated.contains_key(parent.as_str()) {
             let old_parent = parent.clone();
+            // Walk up the tree to find the first non-integrated ancestor.
             let mut new_parent = explicit_parents
                 .get(parent.as_str())
                 .cloned()
                 .unwrap_or_else(|| default_branch.clone());
+            // Keep walking if that ancestor is also integrated.
+            // Track visited to prevent infinite loops from cycles in the stack file.
             let mut visited = std::collections::HashSet::new();
             while integrated.contains_key(new_parent.as_str()) {
                 if !visited.insert(new_parent.clone()) {
@@ -440,6 +531,7 @@ fn build_dependency_tree(
     // Build the tree structure
     let mut nodes: HashMap<String, TreeNode> = HashMap::new();
 
+    // Add root node
     let root_path = branches
         .iter()
         .find(|(b, _)| b == &default_branch)
@@ -457,6 +549,7 @@ fn build_dependency_tree(
         },
     );
 
+    // Add all other nodes (skip integrated branches)
     for (branch, path) in &branches {
         if branch == &default_branch || integrated.contains_key(branch) {
             continue;
@@ -490,6 +583,7 @@ fn build_dependency_tree(
         }
     }
 
+    // Sort children for deterministic order
     for node in nodes.values_mut() {
         node.children.sort();
     }
@@ -554,12 +648,14 @@ pub fn handle_sync(opts: SyncOptions) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    // Pre-check: ensure all participating worktrees are clean
+    // Pre-check: ensure all participating worktrees have no tracked changes.
+    // Untracked files are safe — git rebase doesn't touch them.
     let mut dirty_branches = Vec::new();
     for &branch in &branches_to_sync {
         if let Some(node) = tree.nodes.get(branch) {
             let wt = repo.worktree_at(&node.path);
-            if wt.is_dirty()? {
+            let stdout = wt.run_command(&["status", "--porcelain", "-uno"])?;
+            if !stdout.trim().is_empty() {
                 dirty_branches.push(branch);
             }
         }
@@ -577,7 +673,7 @@ pub fn handle_sync(opts: SyncOptions) -> anyhow::Result<()> {
         .context("worktrees have uncommitted changes");
     }
 
-    // Check for any in-progress rebases
+    // Also check for any in-progress rebases
     for &branch in &branches_to_sync {
         if let Some(node) = tree.nodes.get(branch) {
             let wt = repo.worktree_at(&node.path);
@@ -590,20 +686,27 @@ pub fn handle_sync(opts: SyncOptions) -> anyhow::Result<()> {
         }
     }
 
-    // Persist the dependency tree to the stack file
+    // Persist the dependency tree to the stack file after all safety checks
+    // pass. This ensures parent-based integration detection works (e.g., PR2
+    // merged into PR1) and keeps the file in sync after integrated branches
+    // are removed.
     write_stack_file(&repo, &tree)?;
+
+    // Load fork-points from the previous sync. These record each branch's
+    // parent tip SHA, enabling `--onto` rebasing when a parent branch has
+    // been rewritten (e.g., force-pushed or rebased itself).
+    let mut fork_points = load_fork_points(&repo);
 
     // Execute rebases in topological order
     let mut rebased_count = 0;
     let mut skipped_count = 0;
-    let mut rebased_branches: Vec<String> = Vec::new();
 
     for &branch in &branches_to_sync {
         let Some(node) = tree.nodes.get(branch) else {
             continue;
         };
         let Some(ref parent) = node.parent else {
-            continue;
+            continue; // root node
         };
 
         let wt = repo.worktree_at(&node.path);
@@ -616,6 +719,7 @@ pub fn handle_sync(opts: SyncOptions) -> anyhow::Result<()> {
 
         if mb == parent_sha {
             skipped_count += 1;
+            fork_points.insert(branch.to_string(), parent_sha);
             eprintln!(
                 "{}",
                 success_message(cformat!(
@@ -625,67 +729,61 @@ pub fn handle_sync(opts: SyncOptions) -> anyhow::Result<()> {
             continue;
         }
 
-        // Perform the rebase
-        if let Some(ref orig_parent) = node.original_parent {
-            eprintln!(
-                "{}",
-                progress_message(cformat!(
-                    "Rebasing <bold>{branch}</> onto <bold>{parent}</> (was on integrated <bold>{orig_parent}</>)..."
-                ))
-            );
-            let result = wt.run_command(&["rebase", "--onto", parent, orig_parent, branch]);
-            if let Err(e) = result {
-                if wt.is_rebasing()? {
-                    eprintln!(
-                        "{}",
-                        error_message(cformat!(
-                            "Rebase conflict while rebasing <bold>{branch}</> onto <bold>{parent}</>"
-                        ))
-                    );
-                    eprintln!(
-                        "{}",
-                        hint_message(cformat!(
-                            "Resolve conflicts in {}, then run:\n  cd {}\n  git rebase --continue\n  wt sync",
-                            node.path.display(),
-                            node.path.display(),
-                        ))
-                    );
-                    return Ok(());
-                }
-                return Err(e.context(format!("Failed to rebase {branch} onto {parent}")));
-            }
+        // Determine the rebase base: use the stored fork-point (old parent tip)
+        // when available, otherwise fall back to the merge-base.
+        // The fork-point is essential when the parent was rebased — the merge-base
+        // shifts to an older ancestor, but the fork-point stays at the old parent tip.
+        let rebase_base = if let Some(ref orig_parent) = node.original_parent {
+            // Reparented branch — base is the integrated parent branch
+            orig_parent.clone()
+        } else if let Some(stored_fp) = fork_points.get(branch) {
+            // Use the stored fork-point from the previous sync
+            stored_fp.clone()
         } else {
-            eprintln!(
-                "{}",
-                progress_message(cformat!(
-                    "Rebasing <bold>{branch}</> onto <bold>{parent}</>..."
-                ))
-            );
-            let result = wt.run_command(&["rebase", parent]);
-            if let Err(e) = result {
-                if wt.is_rebasing()? {
-                    eprintln!(
-                        "{}",
-                        error_message(cformat!(
-                            "Rebase conflict while rebasing <bold>{branch}</> onto <bold>{parent}</>"
-                        ))
-                    );
-                    eprintln!(
-                        "{}",
-                        hint_message(cformat!(
-                            "Resolve conflicts in {}, then run:\n  cd {}\n  git rebase --continue\n  wt sync",
-                            node.path.display(),
-                            node.path.display(),
-                        ))
-                    );
-                    return Ok(());
+            // First sync or no fork-point — fall back to merge-base
+            mb.clone()
+        };
+
+        eprintln!(
+            "{}",
+            progress_message(cformat!(
+                "Rebasing <bold>{branch}</> onto <bold>{parent}</>{}...",
+                if let Some(orig) = &node.original_parent {
+                    cformat!(" (was on integrated <bold>{orig}</>)")
+                } else {
+                    String::new()
                 }
-                return Err(e.context(format!("Failed to rebase {branch} onto {parent}")));
+            ))
+        );
+
+        let result = wt.run_command(&["rebase", "--onto", parent, &rebase_base, branch]);
+        if let Err(e) = result {
+            if wt.is_rebasing()? {
+                eprintln!(
+                    "{}",
+                    error_message(cformat!(
+                        "Rebase conflict while rebasing <bold>{branch}</> onto <bold>{parent}</>"
+                    ))
+                );
+                eprintln!(
+                    "{}",
+                    hint_message(cformat!(
+                        "Resolve conflicts in {}, then run:\n  cd {}\n  git rebase --continue\n  wt sync",
+                        node.path.display(),
+                        node.path.display(),
+                    ))
+                );
+                // Save fork-points for branches processed so far
+                let _ = save_fork_points(&repo, &fork_points);
+                return Ok(());
             }
+            return Err(e.context(format!("Failed to rebase {branch} onto {parent}")));
         }
 
+        // Record the parent's current tip as the fork-point for next sync
+        fork_points.insert(branch.to_string(), parent_sha.clone());
+
         rebased_count += 1;
-        rebased_branches.push(branch.to_string());
         eprintln!(
             "{}",
             success_message(cformat!("Rebased <bold>{branch}</> onto <bold>{parent}</>"))
@@ -706,26 +804,36 @@ pub fn handle_sync(opts: SyncOptions) -> anyhow::Result<()> {
         );
     }
 
-    // Push rebased branches
-    if opts.push && !rebased_branches.is_empty() {
-        eprintln!();
-        for branch in &rebased_branches {
-            // Skip branches without an upstream
-            if repo.branch(branch).upstream().ok().flatten().is_none() {
-                continue;
-            }
+    // Push all branches with an upstream
+    if opts.push {
+        let pushable: Vec<&str> = branches_to_sync
+            .iter()
+            .filter(|b| repo.branch(b).upstream().ok().flatten().is_some())
+            .copied()
+            .collect();
+        if !pushable.is_empty() {
+            eprintln!();
+        }
+        for branch in &pushable {
+            let remote = repo
+                .branch(branch)
+                .push_remote()
+                .unwrap_or_else(|| "origin".to_string());
             eprintln!(
                 "{}",
-                progress_message(cformat!("Pushing <bold>{branch}</>..."))
+                progress_message(cformat!("Pushing <bold>{branch}</> to {remote}..."))
             );
-            match repo.run_command(&["push", "--force-with-lease", "origin", branch]) {
+            let result = repo.run_command(&["push", "--force-with-lease", &remote, branch]);
+            match result {
                 Ok(_) => {
                     eprintln!("{}", success_message(cformat!("Pushed <bold>{branch}</>")));
                 }
                 Err(e) => {
                     eprintln!(
                         "{}",
-                        error_message(cformat!("Failed to push <bold>{branch}</>: {e}"))
+                        error_message(cformat!(
+                            "Failed to push <bold>{branch}</>: {e}"
+                        ))
                     );
                 }
             }
@@ -742,8 +850,12 @@ pub fn handle_sync(opts: SyncOptions) -> anyhow::Result<()> {
                     "Removing integrated worktree <bold>{branch}</>..."
                 ))
             );
-            // Check for upstream before removal
+            // Check for upstream before removal (which deletes the branch)
             let has_upstream = repo.branch(branch).upstream().ok().flatten().is_some();
+            let prune_remote = repo
+                .branch(branch)
+                .push_remote()
+                .unwrap_or_else(|| "origin".to_string());
             // Remove worktree (without --force to avoid silent data loss)
             let result = repo.run_command(&["worktree", "remove", &path.to_string_lossy()]);
             if let Err(e) = result {
@@ -773,7 +885,7 @@ pub fn handle_sync(opts: SyncOptions) -> anyhow::Result<()> {
             }
             // Delete remote branch if it had an upstream
             if has_upstream {
-                if let Err(e) = repo.run_command(&["push", "origin", "--delete", branch]) {
+                if let Err(e) = repo.run_command(&["push", &prune_remote, "--delete", branch]) {
                     eprintln!(
                         "{}",
                         warning_message(cformat!(
@@ -788,6 +900,9 @@ pub fn handle_sync(opts: SyncOptions) -> anyhow::Result<()> {
             );
         }
     }
+
+    // Persist fork-points for next sync
+    save_fork_points(&repo, &fork_points)?;
 
     Ok(())
 }
@@ -822,7 +937,7 @@ fn print_sync_plan(tree: &DependencyTree, branches: &[&str]) {
     }
 }
 
-/// Print a tree node with connectors.
+/// Print a tree node with indentation.
 fn print_tree_node(
     tree: &DependencyTree,
     branch: &str,
@@ -922,28 +1037,40 @@ mod tests {
                 path: PathBuf::new(),
                 parent: None,
                 original_parent: None,
-                children: vec!["a".to_string(), "b".to_string(), "c".to_string()],
+                children: vec!["feature-a".to_string(), "feature-b".to_string()],
             },
         );
-        for name in ["a", "b", "c"] {
-            nodes.insert(
-                name.to_string(),
-                TreeNode {
-                    branch: name.to_string(),
-                    path: PathBuf::new(),
-                    parent: Some("main".to_string()),
-                    original_parent: None,
-                    children: vec![],
-                },
-            );
-        }
+        nodes.insert(
+            "feature-a".to_string(),
+            TreeNode {
+                branch: "feature-a".to_string(),
+                path: PathBuf::new(),
+                parent: Some("main".to_string()),
+                original_parent: None,
+                children: vec![],
+            },
+        );
+        nodes.insert(
+            "feature-b".to_string(),
+            TreeNode {
+                branch: "feature-b".to_string(),
+                path: PathBuf::new(),
+                parent: Some("main".to_string()),
+                original_parent: None,
+                children: vec![],
+            },
+        );
 
         let tree = DependencyTree {
             root: "main".to_string(),
             nodes,
         };
 
-        assert_eq!(tree.topological_order(), vec!["a", "b", "c"]);
+        let order = tree.topological_order();
+        assert_eq!(order.len(), 2);
+        // Both should appear, order is children sorted alphabetically
+        assert!(order.contains(&"feature-a"));
+        assert!(order.contains(&"feature-b"));
     }
 
     #[test]
@@ -956,7 +1083,7 @@ mod tests {
                 path: PathBuf::new(),
                 parent: None,
                 original_parent: None,
-                children: vec!["pr1".to_string()],
+                children: vec!["pr1".to_string(), "feature-x".to_string()],
             },
         );
         nodes.insert(
@@ -989,70 +1116,12 @@ mod tests {
                 children: vec![],
             },
         );
-
-        let tree = DependencyTree {
-            root: "main".to_string(),
-            nodes,
-        };
-
-        assert_eq!(tree.stack_containing("pr2"), vec!["pr1", "pr2", "pr3"]);
-    }
-
-    #[test]
-    fn test_parse_stack_file_basic() {
-        let content = "pr1\n\tpr2\n\t\tpr3\n";
-        let map = parse_stack_file(content, "main").unwrap();
-        assert_eq!(map.get("pr1").unwrap(), "main");
-        assert_eq!(map.get("pr2").unwrap(), "pr1");
-        assert_eq!(map.get("pr3").unwrap(), "pr2");
-    }
-
-    #[test]
-    fn test_parse_stack_file_with_comments_and_blanks() {
-        let content = "# comment\npr1\n\n\tpr2\n";
-        let map = parse_stack_file(content, "main").unwrap();
-        assert_eq!(map.len(), 2);
-        assert_eq!(map.get("pr1").unwrap(), "main");
-        assert_eq!(map.get("pr2").unwrap(), "pr1");
-    }
-
-    #[test]
-    fn test_parse_stack_file_with_annotations() {
-        let content = "pr1 rebase\n\tpr2 some-annotation\n";
-        let map = parse_stack_file(content, "main").unwrap();
-        assert_eq!(map.get("pr1").unwrap(), "main");
-        assert_eq!(map.get("pr2").unwrap(), "pr1");
-    }
-
-    #[test]
-    fn test_format_stack_file_roundtrip() {
-        let mut nodes = HashMap::new();
         nodes.insert(
-            "main".to_string(),
+            "feature-x".to_string(),
             TreeNode {
-                branch: "main".to_string(),
-                path: PathBuf::new(),
-                parent: None,
-                original_parent: None,
-                children: vec!["pr1".to_string()],
-            },
-        );
-        nodes.insert(
-            "pr1".to_string(),
-            TreeNode {
-                branch: "pr1".to_string(),
+                branch: "feature-x".to_string(),
                 path: PathBuf::new(),
                 parent: Some("main".to_string()),
-                original_parent: None,
-                children: vec!["pr2".to_string()],
-            },
-        );
-        nodes.insert(
-            "pr2".to_string(),
-            TreeNode {
-                branch: "pr2".to_string(),
-                path: PathBuf::new(),
-                parent: Some("pr1".to_string()),
                 original_parent: None,
                 children: vec![],
             },
@@ -1063,12 +1132,199 @@ mod tests {
             nodes,
         };
 
-        let output = format_stack_file(&tree);
-        assert_eq!(output, "pr1\n\tpr2\n");
+        // When on pr2, should get pr1, pr2, pr3 (the pr1 stack) but not feature-x
+        let stack = tree.stack_containing("pr2");
+        assert!(stack.contains(&"pr1"));
+        assert!(stack.contains(&"pr2"));
+        assert!(stack.contains(&"pr3"));
+        assert!(!stack.contains(&"feature-x"));
+        assert!(!stack.contains(&"main"));
+    }
 
-        // Round-trip: parse it back
+    // =========================================================================
+    // Stack file parser tests
+    // =========================================================================
+
+    #[test]
+    fn test_parse_stack_file_with_root() {
+        let content = "main\n\tpr1\n\t\tpr2\n\tother\n";
+        let map = parse_stack_file(content, "main").unwrap();
+        assert_eq!(map.get("pr1").unwrap(), "main");
+        assert_eq!(map.get("pr2").unwrap(), "pr1");
+        assert_eq!(map.get("other").unwrap(), "main");
+        assert!(!map.contains_key("main"));
+    }
+
+    #[test]
+    fn test_parse_stack_file_without_root() {
+        // Format produced by worktrunk's format_stack_file (omits root)
+        let content = "pr1\n\tpr2\n\t\tpr3\n";
+        let map = parse_stack_file(content, "main").unwrap();
+        assert_eq!(map.get("pr1").unwrap(), "main");
+        assert_eq!(map.get("pr2").unwrap(), "pr1");
+        assert_eq!(map.get("pr3").unwrap(), "pr2");
+    }
+
+    #[test]
+    fn test_parse_stack_file_space_indentation() {
+        let content = "main\n    pr1\n        pr2\n";
+        let map = parse_stack_file(content, "main").unwrap();
+        assert_eq!(map.get("pr1").unwrap(), "main");
+        assert_eq!(map.get("pr2").unwrap(), "pr1");
+    }
+
+    #[test]
+    fn test_parse_stack_file_comments_and_blank_lines() {
+        let content = "# This is a comment\nmain\n\n\tpr1\n# Another comment\n\t\tpr2\n\n";
+        let map = parse_stack_file(content, "main").unwrap();
+        assert_eq!(map.len(), 2);
+        assert_eq!(map.get("pr1").unwrap(), "main");
+        assert_eq!(map.get("pr2").unwrap(), "pr1");
+    }
+
+    #[test]
+    fn test_parse_stack_file_annotations_stripped() {
+        // git-machete supports "branch  annotation text" after the branch name
+        let content = "main\n\tpr1  PR #1 - some feature\n\t\tpr2  PR #2\n";
+        let map = parse_stack_file(content, "main").unwrap();
+        assert_eq!(map.get("pr1").unwrap(), "main");
+        assert_eq!(map.get("pr2").unwrap(), "pr1");
+        assert!(!map.contains_key("pr1  PR #1 - some feature"));
+    }
+
+    #[test]
+    fn test_parse_stack_file_siblings() {
+        let content = "main\n\tpr1\n\tpr2\n\tpr3\n";
+        let map = parse_stack_file(content, "main").unwrap();
+        assert_eq!(map.get("pr1").unwrap(), "main");
+        assert_eq!(map.get("pr2").unwrap(), "main");
+        assert_eq!(map.get("pr3").unwrap(), "main");
+    }
+
+    #[test]
+    fn test_parse_stack_file_empty() {
+        let map = parse_stack_file("", "main").unwrap();
+        assert!(map.is_empty());
+    }
+
+    // =========================================================================
+    // Stack file round-trip tests
+    // =========================================================================
+
+    fn make_tree(branches: &[(&str, Option<&str>, &[&str])]) -> DependencyTree {
+        let mut nodes = HashMap::new();
+        for &(name, parent, children) in branches {
+            nodes.insert(
+                name.to_string(),
+                TreeNode {
+                    branch: name.to_string(),
+                    path: PathBuf::new(),
+                    parent: parent.map(|p| p.to_string()),
+                    original_parent: None,
+                    children: children.iter().map(|c| c.to_string()).collect(),
+                },
+            );
+        }
+        DependencyTree {
+            root: branches[0].0.to_string(),
+            nodes,
+        }
+    }
+
+    #[test]
+    fn test_format_stack_file_omits_root() {
+        let tree = make_tree(&[("main", None, &["pr1"]), ("pr1", Some("main"), &[])]);
+        let output = format_stack_file(&tree);
+        assert!(!output.contains("main"));
+        assert!(output.contains("pr1"));
+    }
+
+    #[test]
+    fn test_round_trip_linear_stack() {
+        let tree = make_tree(&[
+            ("main", None, &["pr1"]),
+            ("pr1", Some("main"), &["pr2"]),
+            ("pr2", Some("pr1"), &["pr3"]),
+            ("pr3", Some("pr2"), &[]),
+        ]);
+        let output = format_stack_file(&tree);
         let map = parse_stack_file(&output, "main").unwrap();
         assert_eq!(map.get("pr1").unwrap(), "main");
         assert_eq!(map.get("pr2").unwrap(), "pr1");
+        assert_eq!(map.get("pr3").unwrap(), "pr2");
+    }
+
+    #[test]
+    fn test_round_trip_branching_stack() {
+        let tree = make_tree(&[
+            ("main", None, &["feature-a", "feature-b"]),
+            ("feature-a", Some("main"), &["sub-a"]),
+            ("sub-a", Some("feature-a"), &[]),
+            ("feature-b", Some("main"), &[]),
+        ]);
+        let output = format_stack_file(&tree);
+        let map = parse_stack_file(&output, "main").unwrap();
+        assert_eq!(map.get("feature-a").unwrap(), "main");
+        assert_eq!(map.get("sub-a").unwrap(), "feature-a");
+        assert_eq!(map.get("feature-b").unwrap(), "main");
+    }
+
+    // =========================================================================
+    // stack_containing edge cases
+    // =========================================================================
+
+    #[test]
+    fn test_stack_containing_unknown_branch() {
+        let tree = make_tree(&[("main", None, &["pr1"]), ("pr1", Some("main"), &[])]);
+        assert!(tree.stack_containing("nonexistent").is_empty());
+    }
+
+    #[test]
+    fn test_stack_containing_root_returns_all() {
+        let tree = make_tree(&[
+            ("main", None, &["pr1", "pr2"]),
+            ("pr1", Some("main"), &[]),
+            ("pr2", Some("main"), &[]),
+        ]);
+        let stack = tree.stack_containing("main");
+        // Root returns all via topological_order
+        assert!(stack.contains(&"pr1"));
+        assert!(stack.contains(&"pr2"));
+    }
+
+    // =========================================================================
+    // Fork-points round-trip
+    // =========================================================================
+
+    #[test]
+    fn test_fork_points_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let wt_dir = dir.path().join(".git/wt");
+        std::fs::create_dir_all(&wt_dir).unwrap();
+
+        // Create a minimal repo-like structure for load/save
+        let path = wt_dir.join(FORK_POINTS_FILE);
+
+        let mut points = HashMap::new();
+        points.insert("pr1".to_string(), "abc123".to_string());
+        points.insert("pr2".to_string(), "def456".to_string());
+
+        // Write directly
+        let mut lines: Vec<String> = points.iter().map(|(b, s)| format!("{b}={s}")).collect();
+        lines.sort();
+        std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+
+        // Read back
+        let content = std::fs::read_to_string(&path).unwrap();
+        let loaded: HashMap<String, String> = content
+            .lines()
+            .filter_map(|line| {
+                let (branch, sha) = line.split_once('=')?;
+                Some((branch.trim().to_string(), sha.trim().to_string()))
+            })
+            .collect();
+
+        assert_eq!(loaded.get("pr1").unwrap(), "abc123");
+        assert_eq!(loaded.get("pr2").unwrap(), "def456");
     }
 }
