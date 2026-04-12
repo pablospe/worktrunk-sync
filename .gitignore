@@ -1,2 +1,12 @@
 /target
-Cargo.lock
+# Lychee link checker cache
+.lycheecache
+
+# Insta snapshot test artifacts
+*.snap.new
+*.snap.pending
+test-results/
+
+# Nix build outputs
+/result
+/result-*
