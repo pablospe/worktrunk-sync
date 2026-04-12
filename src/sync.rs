@@ -25,7 +25,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use anyhow::{Context, bail};
+use anyhow::{bail, Context};
 use color_print::cformat;
 
 use worktrunk::git::Repository;
@@ -608,8 +608,7 @@ pub fn handle_sync(opts: SyncOptions) -> anyhow::Result<()> {
     // Fetch from remote if requested (skip in dry-run)
     if opts.fetch && !opts.dry_run {
         eprintln!("{}", progress_message(cformat!("Fetching from remote...")));
-        repo.run_command(&["fetch"])
-            .context("git fetch failed")?;
+        repo.run_command(&["fetch"]).context("git fetch failed")?;
         eprintln!("{}", success_message("Fetch complete"));
     }
 
@@ -833,9 +832,7 @@ pub fn handle_sync(opts: SyncOptions) -> anyhow::Result<()> {
                 Err(e) => {
                     eprintln!(
                         "{}",
-                        error_message(cformat!(
-                            "Failed to push <bold>{branch}</>: {e}"
-                        ))
+                        error_message(cformat!("Failed to push <bold>{branch}</>: {e}"))
                     );
                 }
             }
