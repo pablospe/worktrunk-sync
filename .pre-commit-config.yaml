@@ -1,0 +1,39 @@
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: mixed-line-ending
+      - id: trailing-whitespace
+        # rustfmt handles rust files
+        exclude: '.*\.rs$'
+  - repo: https://github.com/crate-ci/typos
+    rev: v1.45.0
+    hooks:
+      - id: typos
+        pass_filenames: false
+  - repo: https://github.com/r0x0d/pre-commit-rust
+    rev: v1.0.1
+    hooks:
+      - id: fmt
+  - repo: https://github.com/r0x0d/pre-commit-rust
+    rev: v1.0.1
+    hooks:
+      - id: clippy
+        args: ["--all-targets", "--all-features", "--", "-D", "warnings"]
+  - repo: local
+    hooks:
+      - id: cargo-lock
+        name: cargo-lock
+        description: Ensure Cargo.lock is in sync with Cargo.toml
+        language: system
+        entry: cargo check --locked
+        pass_filenames: false
+        files: (Cargo\.toml|Cargo\.lock)$
+      - id: no-dbg
+        name: no-dbg
+        description: Prevent committing dbg! macros
+        language: pygrep
+        types: ["rust"]
+        entry: "dbg!"

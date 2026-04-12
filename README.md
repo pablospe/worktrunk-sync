@@ -92,6 +92,23 @@ Planned operations:
 - Git with worktrees (`git worktree add`)
 - [worktrunk](https://github.com/max-sixty/worktrunk) >= 0.35 (runtime dependency for repository utilities)
 
+## Development
+
+### Pre-commit hooks
+
+Install [pre-commit](https://pre-commit.com/) and enable hooks:
+
+```bash
+pip install pre-commit
+pre-commit install
+```
+
+Hooks run automatically on each commit (rustfmt, clippy, typos, trailing whitespace, etc.). To run manually:
+
+```bash
+pre-commit run --all-files
+```
+
 ## License
 
 MIT

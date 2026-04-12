@@ -1,0 +1,4 @@
+[default.extend-words]
+# Git commit hashes that typos flags as potential typos
+ba = "ba"
+ede = "ede"
