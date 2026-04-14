@@ -109,6 +109,21 @@ Hooks run automatically on each commit (rustfmt, clippy, typos, trailing whitesp
 pre-commit run --all-files
 ```
 
+### Releasing a new version
+
+1. Bump the version in `Cargo.toml`
+2. Commit and tag:
+   ```bash
+   git add Cargo.toml Cargo.lock
+   git commit -m "release: v0.2.0"
+   git tag v0.2.0
+   git push && git push --tags
+   ```
+3. The [release workflow](.github/workflows/release.yaml) will automatically:
+   - Build and test
+   - Publish to [crates.io](https://crates.io/crates/worktrunk-sync)
+   - Create a GitHub release with auto-generated notes
+
 ## License
 
 MIT
