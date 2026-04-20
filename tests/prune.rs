@@ -33,7 +33,7 @@ fn wt_sync_bin() -> std::path::PathBuf {
 ///   main (initial commit + merge commit)
 ///   └── feature (one commit, merged into main)
 ///
-/// Returns (repo_dir, feature_worktree_path)
+/// Returns the feature worktree path. Repo lives at `tmp/repo`.
 fn setup_repo_with_integrated_branch(tmp: &Path) -> std::path::PathBuf {
     let repo = tmp.join("repo");
     std::fs::create_dir_all(&repo).unwrap();
