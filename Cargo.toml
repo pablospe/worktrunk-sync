@@ -2,7 +2,7 @@
 name = "worktrunk-sync"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.85"
+rust-version = "1.93"
 description = "wt sync — rebase stacked worktree branches in dependency order"
 license = "MIT"
 repository = "https://github.com/pablospe/worktrunk-sync"
@@ -16,7 +16,7 @@ anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 clap_complete = { version = "4", features = ["unstable-dynamic"] }
 color-print = "0.3"
-worktrunk = "0.35"
+worktrunk = "0.41.0"
 
 [dev-dependencies]
 tempfile = "3.27.0"
