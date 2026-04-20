@@ -123,7 +123,11 @@ fn test_prune_removes_integrated_worktree() {
 }
 
 #[test]
-fn test_prune_skips_non_integrated_worktrees() {
+fn test_prune_only_removes_integrated_worktree_not_wip() {
+    // Exercises the prune loop with both an integrated branch (should be removed)
+    // and a non-integrated branch (should survive). This ensures the skip behaviour
+    // is tested within an active prune pass, not just by short-circuiting on an
+    // empty `integrated` list.
     let tmp = tempfile::tempdir().unwrap();
     let repo = tmp.path().join("repo");
     std::fs::create_dir_all(&repo).unwrap();
@@ -133,15 +137,34 @@ fn test_prune_skips_non_integrated_worktrees() {
     git(&repo, &["add", "."]);
     git(&repo, &["commit", "-m", "initial commit"]);
 
-    // Create a worktree for a branch that is NOT integrated
-    let wt_path = tmp.path().join("worktrees").join("wip");
+    // Create a worktree for a branch that will be integrated
+    let done_path = tmp.path().join("worktrees").join("done");
     git(
         &repo,
-        &["worktree", "add", "-b", "wip", &wt_path.to_string_lossy()],
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "done",
+            &done_path.to_string_lossy(),
+        ],
     );
-    std::fs::write(wt_path.join("wip.txt"), "work in progress").unwrap();
-    git(&wt_path, &["add", "."]);
-    git(&wt_path, &["commit", "-m", "wip commit"]);
+    std::fs::write(done_path.join("done.txt"), "done work").unwrap();
+    git(&done_path, &["add", "."]);
+    git(&done_path, &["commit", "-m", "done work"]);
+
+    // Create a worktree for a branch that is NOT integrated
+    let wip_path = tmp.path().join("worktrees").join("wip");
+    git(
+        &repo,
+        &["worktree", "add", "-b", "wip", &wip_path.to_string_lossy()],
+    );
+    std::fs::write(wip_path.join("wip.txt"), "work in progress").unwrap();
+    git(&wip_path, &["add", "."]);
+    git(&wip_path, &["commit", "-m", "wip commit"]);
+
+    // Merge `done` into main (making it integrated)
+    git(&repo, &["merge", "done", "--no-ff", "-m", "Merge done"]);
 
     // Run wt-sync --prune --all
     let output = Command::new(wt_sync_bin())
@@ -151,16 +174,19 @@ fn test_prune_skips_non_integrated_worktrees() {
         .output()
         .expect("failed to run wt-sync");
 
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "wt-sync should succeed: {stderr}",);
+
+    // The integrated worktree should be gone
+    assert!(!done_path.exists(), "integrated worktree should be removed");
+    let branches = git(&repo, &["branch"]);
     assert!(
-        output.status.success(),
-        "wt-sync should succeed: {}",
-        String::from_utf8_lossy(&output.stderr),
+        !branches.contains("done"),
+        "integrated branch should be deleted"
     );
 
     // The non-integrated worktree should still exist
-    assert!(wt_path.exists(), "non-integrated worktree should remain");
-
-    let branches = git(&repo, &["branch"]);
+    assert!(wip_path.exists(), "non-integrated worktree should remain");
     assert!(
         branches.contains("wip"),
         "non-integrated branch should remain"
