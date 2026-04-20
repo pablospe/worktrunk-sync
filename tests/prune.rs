@@ -62,7 +62,10 @@ fn setup_repo_with_integrated_branch(tmp: &Path) -> std::path::PathBuf {
     git(&wt_path, &["commit", "-m", "feature work"]);
 
     // Merge the feature branch into main (making it "integrated")
-    git(&repo, &["merge", "feature", "--no-ff", "-m", "Merge feature"]);
+    git(
+        &repo,
+        &["merge", "feature", "--no-ff", "-m", "Merge feature"],
+    );
 
     wt_path
 }
@@ -78,7 +81,10 @@ fn test_prune_removes_integrated_worktree() {
 
     // Verify the branch exists
     let branches = git(&repo, &["branch"]);
-    assert!(branches.contains("feature"), "feature branch should exist before prune");
+    assert!(
+        branches.contains("feature"),
+        "feature branch should exist before prune"
+    );
 
     // Run wt-sync --prune --all from the main worktree
     let output = Command::new(wt_sync_bin())
@@ -131,13 +137,7 @@ fn test_prune_skips_non_integrated_worktrees() {
     let wt_path = tmp.path().join("worktrees").join("wip");
     git(
         &repo,
-        &[
-            "worktree",
-            "add",
-            "-b",
-            "wip",
-            &wt_path.to_string_lossy(),
-        ],
+        &["worktree", "add", "-b", "wip", &wt_path.to_string_lossy()],
     );
     std::fs::write(wt_path.join("wip.txt"), "work in progress").unwrap();
     git(&wt_path, &["add", "."]);
@@ -161,5 +161,8 @@ fn test_prune_skips_non_integrated_worktrees() {
     assert!(wt_path.exists(), "non-integrated worktree should remain");
 
     let branches = git(&repo, &["branch"]);
-    assert!(branches.contains("wip"), "non-integrated branch should remain");
+    assert!(
+        branches.contains("wip"),
+        "non-integrated branch should remain"
+    );
 }

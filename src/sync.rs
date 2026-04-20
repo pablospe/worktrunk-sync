@@ -28,7 +28,7 @@ use std::path::PathBuf;
 use anyhow::{bail, Context};
 use color_print::cformat;
 
-use worktrunk::git::{BranchDeletionMode, RemoveOptions, Repository, remove_worktree_with_cleanup};
+use worktrunk::git::{remove_worktree_with_cleanup, BranchDeletionMode, RemoveOptions, Repository};
 use worktrunk::styling::{
     eprintln, error_message, hint_message, progress_message, success_message, warning_message,
 };
@@ -638,7 +638,7 @@ pub fn handle_sync(opts: SyncOptions) -> anyhow::Result<()> {
         tree.topological_order()
     };
 
-    if branches_to_sync.is_empty() && !(opts.prune && !integrated.is_empty()) {
+    if branches_to_sync.is_empty() && (!opts.prune || integrated.is_empty()) {
         eprintln!("{}", success_message("All branches are up to date."));
         return Ok(());
     }
