@@ -153,7 +153,12 @@ fn test_prune_only_removes_integrated_worktree_not_wip() {
     git(&done_path, &["add", "."]);
     git(&done_path, &["commit", "-m", "done work"]);
 
-    // Create a worktree for a branch that is NOT integrated
+    // Merge `done` into main (making it integrated)
+    git(&repo, &["merge", "done", "--no-ff", "-m", "Merge done"]);
+
+    // Create a worktree for a branch that is NOT integrated.
+    // Created after the merge so wip is based on main's current tip —
+    // no rebase needed, which isolates the test to prune behaviour only.
     let wip_path = tmp.path().join("worktrees").join("wip");
     git(
         &repo,
@@ -162,9 +167,6 @@ fn test_prune_only_removes_integrated_worktree_not_wip() {
     std::fs::write(wip_path.join("wip.txt"), "work in progress").unwrap();
     git(&wip_path, &["add", "."]);
     git(&wip_path, &["commit", "-m", "wip commit"]);
-
-    // Merge `done` into main (making it integrated)
-    git(&repo, &["merge", "done", "--no-ff", "-m", "Merge done"]);
 
     // Run wt-sync --prune --all
     let output = Command::new(wt_sync_bin())
