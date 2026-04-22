@@ -193,4 +193,15 @@ fn test_prune_only_removes_integrated_worktree_not_wip() {
         branches.contains("wip"),
         "non-integrated branch should remain"
     );
+
+    // Verify git worktree metadata is consistent (catches fast-path rename desync)
+    let worktrees = git(&repo, &["worktree", "list"]);
+    assert!(
+        !worktrees.contains("done"),
+        "integrated worktree should not appear in git worktree list"
+    );
+    assert!(
+        worktrees.contains("wip"),
+        "non-integrated worktree should appear in git worktree list"
+    );
 }
