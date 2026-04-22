@@ -27,18 +27,32 @@ jobs:
       - name: Test
         run: cargo test --release
 
-      - name: Fetch crates.io OIDC token
+      - name: Publish to crates.io (trusted publishing)
         run: |
-          response=$(curl -sS -X POST \
+          # 1. Get OIDC token from GitHub Actions
+          oidc_response=$(curl -sS -X POST \
             "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=https://crates.io" \
             -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
             -H "Accept: application/json")
-          token=$(echo "$response" | jq -r '.value')
-          echo "::add-mask::${token}"
-          echo "CARGO_REGISTRY_TOKEN=cio_${token}" >> "$GITHUB_ENV"
+          oidc_token=$(echo "$oidc_response" | jq -r '.value')
 
-      - name: Publish to crates.io
-        run: cargo publish
+          # 2. Exchange OIDC token for a crates.io publish token
+          exchange_response=$(curl -sS -X POST \
+            "https://crates.io/api/v1/trusted_publishing/tokens" \
+            -H "Content-Type: application/json" \
+            -d "{\"jwt\": \"${oidc_token}\"}")
+          publish_token=$(echo "$exchange_response" | jq -r '.token')
+
+          if [ "$publish_token" = "null" ] || [ -z "$publish_token" ]; then
+            echo "::error::Failed to exchange OIDC token: $exchange_response"
+            exit 1
+          fi
+
+          echo "::add-mask::${publish_token}"
+          export CARGO_REGISTRY_TOKEN="${publish_token}"
+
+          # 3. Publish
+          cargo publish
 
       - name: Create GitHub release
         env:
