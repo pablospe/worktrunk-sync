@@ -28,7 +28,7 @@ use std::path::PathBuf;
 use anyhow::{bail, Context};
 use color_print::cformat;
 
-use worktrunk::git::Repository;
+use worktrunk::git::{remove_worktree_with_cleanup, BranchDeletionMode, RemoveOptions, Repository};
 use worktrunk::styling::{
     eprintln, error_message, hint_message, progress_message, success_message, warning_message,
 };
@@ -638,7 +638,7 @@ pub fn handle_sync(opts: SyncOptions) -> anyhow::Result<()> {
         tree.topological_order()
     };
 
-    if branches_to_sync.is_empty() {
+    if branches_to_sync.is_empty() && (!opts.prune || integrated.is_empty()) {
         eprintln!("{}", success_message("All branches are up to date."));
         return Ok(());
     }
@@ -849,35 +849,51 @@ pub fn handle_sync(opts: SyncOptions) -> anyhow::Result<()> {
                     "Removing integrated worktree <bold>{branch}</>..."
                 ))
             );
-            // Check for upstream before removal (which deletes the branch)
             let has_upstream = repo.branch(branch).upstream().ok().flatten().is_some();
             let prune_remote = repo
                 .branch(branch)
                 .push_remote()
                 .unwrap_or_else(|| "origin".to_string());
-            let result = if opts.force {
-                repo.run_command(&["worktree", "remove", "--force", &path.to_string_lossy()])
-            } else {
-                repo.run_command(&["worktree", "remove", &path.to_string_lossy()])
+
+            let output = remove_worktree_with_cleanup(
+                &repo,
+                path,
+                RemoveOptions {
+                    branch: Some(branch.clone()),
+                    // We've already decided these branches are integrated, so skip
+                    // the re-check and force-delete.
+                    deletion_mode: BranchDeletionMode::ForceDelete,
+                    target_branch: None,
+                    force_worktree: opts.force,
+                },
+            );
+            let output = match output {
+                Ok(o) => o,
+                Err(e) => {
+                    eprintln!(
+                        "{}",
+                        error_message(cformat!(
+                            "Failed to remove worktree for <bold>{branch}</>: {e}"
+                        ))
+                    );
+                    eprintln!(
+                        "{}",
+                        hint_message(cformat!(
+                            "Clean up the worktree manually, then run: git worktree remove {}",
+                            path.to_string_lossy()
+                        ))
+                    );
+                    continue;
+                }
             };
-            if let Err(e) = result {
-                eprintln!(
-                    "{}",
-                    error_message(cformat!(
-                        "Failed to remove worktree for <bold>{branch}</>: {e}"
-                    ))
-                );
-                eprintln!(
-                    "{}",
-                    hint_message(cformat!(
-                        "Clean up the worktree manually, then run: git worktree remove {}",
-                        path.to_string_lossy()
-                    ))
-                );
-                continue;
+
+            // Fast-path rename leaves the old directory in trash; delete it.
+            if let Some(staged) = &output.staged_path {
+                let _ = std::fs::remove_dir_all(staged);
             }
-            // Delete the local branch
-            if let Err(e) = repo.run_command(&["branch", "-D", branch]) {
+
+            // Surface any `branch -D` failure (worktree removal still succeeded).
+            if let Some(Err(e)) = output.branch_result {
                 eprintln!(
                     "{}",
                     warning_message(cformat!(
@@ -885,7 +901,8 @@ pub fn handle_sync(opts: SyncOptions) -> anyhow::Result<()> {
                     ))
                 );
             }
-            // Delete remote branch if it had an upstream
+
+            // Remote delete is still the caller's responsibility.
             if has_upstream {
                 if let Err(e) = repo.run_command(&["push", &prune_remote, "--delete", branch]) {
                     eprintln!(
@@ -896,6 +913,7 @@ pub fn handle_sync(opts: SyncOptions) -> anyhow::Result<()> {
                     );
                 }
             }
+
             eprintln!(
                 "{}",
                 success_message(cformat!("Removed integrated worktree <bold>{branch}</>"))
