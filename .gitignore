@@ -10,3 +10,6 @@ test-results/
 # Nix build outputs
 /result
 /result-*
+
+# Git Worktrees
+.worktrees
