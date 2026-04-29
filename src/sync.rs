@@ -331,6 +331,10 @@ fn build_dependency_tree(
 
     let mut integrated: HashMap<String, PathBuf> = HashMap::new();
 
+    // Set of locally-known branch names (for validating stack file references)
+    let local_branches: std::collections::HashSet<&str> =
+        branches.iter().map(|(b, _)| b.as_str()).collect();
+
     // Parse stack file once (used for parent detection, integration checks, and reparenting)
     let stack_file_path = repo.wt_dir().join(STACK_FILE);
     let explicit_parents: HashMap<String, String> = if stack_file_path.exists() {
@@ -362,7 +366,7 @@ fn build_dependency_tree(
                 continue;
             }
             if let Some(parent) = explicit_parents.get(branch) {
-                if parent != target_ref {
+                if parent != target_ref && local_branches.contains(parent.as_str()) {
                     let (_, reason) = repo.integration_reason(branch, parent)?;
                     if reason.is_some() {
                         integrated.insert(branch.clone(), path.clone());
@@ -383,6 +387,7 @@ fn build_dependency_tree(
             }
             let parent = explicit_parents
                 .get(branch)
+                .filter(|p| local_branches.contains(p.as_str()))
                 .cloned()
                 .unwrap_or_else(|| default_branch.clone());
             parent_map.insert(branch.clone(), (parent, None));
@@ -510,6 +515,7 @@ fn build_dependency_tree(
             // Walk up the tree to find the first non-integrated ancestor.
             let mut new_parent = explicit_parents
                 .get(parent.as_str())
+                .filter(|p| local_branches.contains(p.as_str()))
                 .cloned()
                 .unwrap_or_else(|| default_branch.clone());
             // Keep walking if that ancestor is also integrated.
@@ -522,6 +528,7 @@ fn build_dependency_tree(
                 }
                 new_parent = explicit_parents
                     .get(new_parent.as_str())
+                    .filter(|p| local_branches.contains(p.as_str()))
                     .cloned()
                     .unwrap_or_else(|| default_branch.clone());
             }
