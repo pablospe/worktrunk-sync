@@ -94,6 +94,14 @@ Planned operations:
 
 ## Development
 
+### Build & test
+
+```bash
+cargo build
+cargo test
+cargo clippy --all-targets -- -D warnings
+```
+
 ### Pre-commit hooks
 
 Install [pre-commit](https://pre-commit.com/) and enable hooks:
