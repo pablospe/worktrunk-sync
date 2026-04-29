@@ -205,3 +205,61 @@ fn test_prune_only_removes_integrated_worktree_not_wip() {
         "non-integrated worktree should appear in git worktree list"
     );
 }
+
+#[test]
+fn test_stale_branch_in_stack_file_does_not_crash() {
+    // When the stack file references a branch that no longer exists locally
+    // (e.g., it was deleted without updating the stack file), wt-sync should
+    // handle it gracefully — reparenting children to the default branch —
+    // instead of crashing with a git error.
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+
+    git(&repo, &["init", "-b", "main"]);
+    std::fs::write(repo.join("file.txt"), "initial").unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-m", "initial commit"]);
+
+    // Create a worktree for a child branch
+    let child_path = tmp.path().join("worktrees").join("child");
+    git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "child",
+            &child_path.to_string_lossy(),
+        ],
+    );
+    std::fs::write(child_path.join("child.txt"), "child work").unwrap();
+    git(&child_path, &["add", "."]);
+    git(&child_path, &["commit", "-m", "child commit"]);
+
+    // Write a stack file referencing a parent branch that doesn't exist
+    let wt_dir = repo.join(".git").join("wt");
+    std::fs::create_dir_all(&wt_dir).unwrap();
+    std::fs::write(wt_dir.join("stack"), "main\n  deleted-parent\n    child\n").unwrap();
+
+    // wt-sync should not crash — child should be reparented to main
+    let output = Command::new(wt_sync_bin())
+        .args(["--dry-run", "--all"])
+        .current_dir(&repo)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .output()
+        .expect("failed to run wt-sync");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "wt-sync should not crash with stale stack file entries:\nstdout: {}\nstderr: {stderr}",
+        String::from_utf8_lossy(&output.stdout),
+    );
+
+    // child should be reparented to main
+    assert!(
+        stderr.contains("rebase child onto main"),
+        "child should be reparented to main, got stderr: {stderr}"
+    );
+}
