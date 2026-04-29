@@ -240,11 +240,7 @@ fn test_stale_branch_in_stack_file_does_not_crash() {
     // Write a stack file referencing a parent branch that doesn't exist
     let wt_dir = repo.join(".git").join("wt");
     std::fs::create_dir_all(&wt_dir).unwrap();
-    std::fs::write(
-        wt_dir.join("stack"),
-        "main\n  deleted-parent\n    child\n",
-    )
-    .unwrap();
+    std::fs::write(wt_dir.join("stack"), "main\n  deleted-parent\n    child\n").unwrap();
 
     // wt-sync should not crash — child should be reparented to main
     let output = Command::new(wt_sync_bin())
