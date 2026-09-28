@@ -41,7 +41,7 @@ struct Cli {
     ///
     /// Pushes every branch in the selected scope (current stack, or all with
     /// `--all`) that has an upstream, in dependency order.
-    #[arg(long, conflicts_with_all = ["fetch", "no_push", "prune"])]
+    #[arg(long, conflicts_with_all = ["fetch", "no_push", "prune", "force"])]
     push_only: bool,
 
     /// Remove integrated worktrees after syncing
@@ -122,7 +122,7 @@ mod tests {
 
     #[test]
     fn test_push_only_conflicts() {
-        for flag in ["--fetch", "--prune", "--no-push"] {
+        for flag in ["--fetch", "--prune", "--no-push", "--force"] {
             assert!(
                 Cli::try_parse_from(["wt-sync", "--push-only", flag]).is_err(),
                 "--push-only should conflict with {flag}"

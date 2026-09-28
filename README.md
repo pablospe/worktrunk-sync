@@ -55,7 +55,7 @@ wt sync --push-only        # current stack
 wt sync --push-only --all  # every stack
 ```
 
-Pushes each branch in the selected scope as-is (`git push --force-with-lease`), in dependency order, without fetching or rebasing. Branches without an upstream are skipped, just like with `--push`. Worktrees don't need to be clean, and the stack/fork-point files are left untouched. Combine with `-nv` to preview the push commands. Cannot be combined with `--fetch` or `--prune`.
+Pushes each branch in the selected scope as-is (`git push --force-with-lease`), in dependency order, without fetching or rebasing. Branches without an upstream are skipped, just like with `--push`. Worktrees don't need to be clean, and the stack/fork-point files are left untouched. Exits non-zero if any push fails. Run from the default branch's worktree, the "current stack" is every stack, so all branches are pushed. Combine with `-nv` to preview the push commands. Cannot be combined with `--fetch` or `--prune`.
 
 ### Flags
 

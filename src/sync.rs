@@ -661,11 +661,15 @@ pub fn handle_sync(opts: SyncOptions) -> anyhow::Result<()> {
 
     // Push-only mode: no rebase, so no worktree safety checks or state updates
     if opts.push_only {
-        if push_branches(&repo, &branches_to_sync) == 0 {
+        let (attempted, failed) = push_branches(&repo, &branches_to_sync);
+        if attempted == 0 {
             eprintln!(
                 "{}",
                 success_message("No branches with an upstream to push.")
             );
+        }
+        if failed > 0 {
+            bail!("{failed} of {attempted} pushes failed");
         }
         return Ok(());
     }
@@ -935,9 +939,10 @@ fn push_targets(repo: &Repository, branches: &[&str]) -> Vec<(String, String)> {
 }
 
 /// Force-push (with lease) every branch that has an upstream, in the given order.
-/// Returns the number of branches a push was attempted for.
-fn push_branches(repo: &Repository, branches: &[&str]) -> usize {
+/// Returns `(attempted, failed)` push counts.
+fn push_branches(repo: &Repository, branches: &[&str]) -> (usize, usize) {
     let targets = push_targets(repo, branches);
+    let mut failed = 0;
     if !targets.is_empty() {
         eprintln!();
     }
@@ -952,6 +957,7 @@ fn push_branches(repo: &Repository, branches: &[&str]) -> usize {
                 eprintln!("{}", success_message(cformat!("Pushed <bold>{branch}</>")));
             }
             Err(e) => {
+                failed += 1;
                 eprintln!(
                     "{}",
                     error_message(cformat!("Failed to push <bold>{branch}</>: {e}"))
@@ -959,7 +965,7 @@ fn push_branches(repo: &Repository, branches: &[&str]) -> usize {
             }
         }
     }
-    targets.len()
+    (targets.len(), failed)
 }
 
 /// Print the sync plan (dry-run mode).
