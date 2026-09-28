@@ -512,7 +512,7 @@ fn build_dependency_tree(
     // non-integrated ancestor. With a stack file, this uses the explicit parent
     // chain (e.g., pr2 integrated into pr1 → pr3 reparents to pr1). Without a
     // stack file, falls back to the default branch.
-    for (_branch, (parent, original_parent)) in parent_map.iter_mut() {
+    for (parent, original_parent) in parent_map.values_mut() {
         if integrated.contains_key(parent.as_str()) {
             let old_parent = parent.clone();
             // Walk up the tree to find the first non-integrated ancestor.
