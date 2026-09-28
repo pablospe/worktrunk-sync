@@ -263,3 +263,95 @@ fn test_stale_branch_in_stack_file_does_not_crash() {
         "child should be reparented to main, got stderr: {stderr}"
     );
 }
+
+/// Sets up `tmp/origin.git` (bare) and a clone at `tmp/repo` with a pushed
+/// `feature` worktree that is merged into local `main`. With `push_merge`, the
+/// merge is pushed; without, `origin/main` gains an unrelated commit instead,
+/// so local and upstream `main` diverge and only local `main` has the merge.
+///
+/// Returns (repo path, feature worktree path).
+fn setup_repo_with_remote(
+    tmp: &Path,
+    push_merge: bool,
+) -> (std::path::PathBuf, std::path::PathBuf) {
+    let origin = tmp.join("origin.git");
+    git(
+        tmp,
+        &["init", "--bare", "-b", "main", &origin.to_string_lossy()],
+    );
+    let wt_path = setup_repo_with_integrated_branch(tmp);
+    let repo = tmp.join("repo");
+    git(
+        &repo,
+        &["remote", "add", "origin", &origin.to_string_lossy()],
+    );
+    git(&repo, &["push", "-u", "origin", "main~1:refs/heads/main"]);
+    git(&repo, &["branch", "--set-upstream-to=origin/main", "main"]);
+    git(&wt_path, &["push", "-u", "origin", "feature"]);
+
+    if push_merge {
+        git(&repo, &["push", "origin", "main"]);
+    } else {
+        let other = tmp.join("other");
+        git(
+            tmp,
+            &["clone", &origin.to_string_lossy(), &other.to_string_lossy()],
+        );
+        std::fs::write(other.join("other.txt"), "other").unwrap();
+        git(&other, &["add", "."]);
+        git(&other, &["commit", "-m", "unrelated remote work"]);
+        git(&other, &["push", "origin", "main"]);
+        git(&repo, &["fetch", "origin"]);
+    }
+    (repo, wt_path)
+}
+
+fn run_prune(repo: &Path) -> String {
+    let output = Command::new(wt_sync_bin())
+        .args(["--prune", "--all"])
+        .current_dir(repo)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .output()
+        .expect("failed to run wt-sync");
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    assert!(
+        output.status.success(),
+        "wt-sync --prune --all failed:\n{stderr}"
+    );
+    stderr
+}
+
+#[test]
+fn test_prune_keeps_remote_branch_when_merge_is_local_only() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (repo, wt_path) = setup_repo_with_remote(tmp.path(), false);
+
+    let stderr = run_prune(&repo);
+
+    // Integrated into local main: worktree and local branch go...
+    assert!(!wt_path.exists(), "worktree should be removed:\n{stderr}");
+    assert!(!git(&repo, &["branch"]).contains("feature"));
+    // ...but origin/main lacks the merge, so the remote branch stays.
+    let remote = git(&repo, &["ls-remote", "--heads", "origin", "feature"]);
+    assert!(
+        remote.contains("refs/heads/feature"),
+        "remote branch should be kept, stderr:\n{stderr}"
+    );
+    assert!(stderr.contains("Kept remote branch"), "stderr:\n{stderr}");
+}
+
+#[test]
+fn test_prune_deletes_remote_branch_when_merge_is_pushed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (repo, wt_path) = setup_repo_with_remote(tmp.path(), true);
+
+    let stderr = run_prune(&repo);
+
+    assert!(!wt_path.exists(), "worktree should be removed:\n{stderr}");
+    assert!(!git(&repo, &["branch"]).contains("feature"));
+    let remote = git(&repo, &["ls-remote", "--heads", "origin", "feature"]);
+    assert!(
+        remote.is_empty(),
+        "remote branch should be deleted, got {remote:?}, stderr:\n{stderr}"
+    );
+}

@@ -29,10 +29,24 @@ use std::path::PathBuf;
 use anyhow::{bail, Context};
 use color_print::cformat;
 
-use worktrunk::git::{remove_worktree_with_cleanup, BranchDeletionMode, RemoveOptions, Repository};
+use worktrunk::git::{
+    remove_worktree_with_cleanup, BranchDeletionMode, InProgressOperation, RemoveOptions,
+    Repository,
+};
 use worktrunk::styling::{
     eprintln, error_message, hint_message, progress_message, success_message, warning_message,
 };
+
+/// A branch whose work is already in its target (removed with `--prune`).
+#[derive(Debug)]
+struct IntegratedBranch {
+    branch: String,
+    path: PathBuf,
+    /// Also integrated into the target's upstream. Only then is the remote
+    /// branch deleted: a merge that exists only locally hasn't reached the
+    /// remote yet, and deleting the branch there could close its open PR.
+    merged_upstream: bool,
+}
 
 /// A node in the dependency tree.
 #[derive(Debug)]
@@ -296,7 +310,7 @@ fn write_stack_file(repo: &Repository, tree: &DependencyTree) -> anyhow::Result<
 /// instead of merge-base inference.
 fn build_dependency_tree(
     repo: &Repository,
-) -> anyhow::Result<(DependencyTree, Vec<(String, PathBuf)>)> {
+) -> anyhow::Result<(DependencyTree, Vec<IntegratedBranch>)> {
     let default_branch = repo
         .default_branch()
         .context("Cannot determine default branch")?;
@@ -305,7 +319,7 @@ fn build_dependency_tree(
 
     // Collect branches with worktrees, filtering detached/bare
     let mut branches: Vec<(String, PathBuf)> = Vec::new();
-    for wt in &worktrees {
+    for wt in worktrees {
         if wt.bare || wt.detached {
             continue;
         }
@@ -329,10 +343,13 @@ fn build_dependency_tree(
     // With a stack file, we also check against each branch's explicit parent,
     // which detects merges between non-default branches (e.g., PR2 squash-merged
     // into PR1).
-    let integration_target = repo.integration_target();
-    let target_ref = integration_target.as_deref().unwrap_or(&default_branch);
+    //
+    // `integration_reason` resolves the target's upstream itself, so passing the
+    // local default branch also catches branches merged only on the remote.
+    let snapshot = repo.capture_refs()?;
 
-    let mut integrated: HashMap<String, PathBuf> = HashMap::new();
+    // branch -> (worktree path, target it was found integrated into)
+    let mut integrated: HashMap<String, (PathBuf, String)> = HashMap::new();
 
     // Set of locally-known branch names (for validating stack file references)
     let local_branches: std::collections::HashSet<&str> =
@@ -354,9 +371,9 @@ fn build_dependency_tree(
         if branch == &default_branch {
             continue;
         }
-        let (_, reason) = repo.integration_reason(branch, target_ref)?;
+        let (_, reason) = repo.integration_reason(&snapshot, branch, &default_branch)?;
         if reason.is_some() {
-            integrated.insert(branch.clone(), path.clone());
+            integrated.insert(branch.clone(), (path.clone(), default_branch.clone()));
         }
     }
 
@@ -369,10 +386,10 @@ fn build_dependency_tree(
                 continue;
             }
             if let Some(parent) = explicit_parents.get(branch) {
-                if parent != target_ref && local_branches.contains(parent.as_str()) {
-                    let (_, reason) = repo.integration_reason(branch, parent)?;
+                if parent != &default_branch && local_branches.contains(parent.as_str()) {
+                    let (_, reason) = repo.integration_reason(&snapshot, branch, parent)?;
                     if reason.is_some() {
-                        integrated.insert(branch.clone(), path.clone());
+                        integrated.insert(branch.clone(), (path.clone(), parent.clone()));
                     }
                 }
             }
@@ -472,12 +489,12 @@ fn build_dependency_tree(
 
             if tie_candidates.len() > 1 {
                 let mb_shas: Vec<&str> = tie_candidates.iter().map(|(_, mb)| mb.as_str()).collect();
-                let timestamps = repo.commit_timestamps(&mb_shas)?;
+                let commits = repo.commit_details_many(&mb_shas)?;
 
                 let mut best_ts = i64::MIN;
                 let mut resolved_parent: Option<&str> = None;
                 for (candidate, mb) in &tie_candidates {
-                    if let Some(&ts) = timestamps.get(mb.as_str()) {
+                    if let Some(&(_, ts, _)) = commits.get(mb.as_str()) {
                         if ts > best_ts {
                             best_ts = ts;
                             resolved_parent = Some(candidate);
@@ -600,7 +617,21 @@ fn build_dependency_tree(
         node.children.sort();
     }
 
-    let integrated_list: Vec<(String, PathBuf)> = integrated.into_iter().collect();
+    let mut integrated_list = Vec::with_capacity(integrated.len());
+    for (branch, (path, target)) in integrated {
+        let merged_upstream = match snapshot.upstream_of(&target) {
+            Some(upstream) => repo
+                .integration_reason(&snapshot, &branch, upstream)?
+                .1
+                .is_some(),
+            None => false,
+        };
+        integrated_list.push(IntegratedBranch {
+            branch,
+            path,
+            merged_upstream,
+        });
+    }
 
     Ok((
         DependencyTree {
@@ -708,7 +739,7 @@ pub fn handle_sync(opts: SyncOptions) -> anyhow::Result<()> {
     for &branch in &branches_to_sync {
         if let Some(node) = tree.nodes.get(branch) {
             let wt = repo.worktree_at(&node.path);
-            if wt.is_rebasing()? {
+            if wt.operation_in_progress()? == Some(InProgressOperation::Rebase) {
                 return Err(anyhow::anyhow!(
                     "Resolve it with `git rebase --continue` or `git rebase --abort` first."
                 ))
@@ -789,7 +820,7 @@ pub fn handle_sync(opts: SyncOptions) -> anyhow::Result<()> {
 
         let result = wt.run_command(&["rebase", "--onto", parent, &rebase_base, branch]);
         if let Err(e) = result {
-            if wt.is_rebasing()? {
+            if wt.operation_in_progress()? == Some(InProgressOperation::Rebase) {
                 eprintln!(
                     "{}",
                     error_message(cformat!(
@@ -842,8 +873,15 @@ pub fn handle_sync(opts: SyncOptions) -> anyhow::Result<()> {
 
     // Prune integrated worktrees
     if opts.prune && !integrated.is_empty() {
+        // Fresh snapshot: the rebase/push phases above may have moved refs.
+        let snapshot = repo.capture_refs()?;
         eprintln!();
-        for (branch, path) in &integrated {
+        for IntegratedBranch {
+            branch,
+            path,
+            merged_upstream,
+        } in &integrated
+        {
             eprintln!(
                 "{}",
                 progress_message(cformat!(
@@ -858,6 +896,7 @@ pub fn handle_sync(opts: SyncOptions) -> anyhow::Result<()> {
 
             let output = remove_worktree_with_cleanup(
                 &repo,
+                &snapshot,
                 path,
                 RemoveOptions {
                     branch: Some(branch.clone()),
@@ -904,7 +943,7 @@ pub fn handle_sync(opts: SyncOptions) -> anyhow::Result<()> {
             }
 
             // Remote delete is still the caller's responsibility.
-            if has_upstream {
+            if has_upstream && *merged_upstream {
                 if let Err(e) = repo.run_command(&["push", &prune_remote, "--delete", branch]) {
                     eprintln!(
                         "{}",
@@ -913,6 +952,13 @@ pub fn handle_sync(opts: SyncOptions) -> anyhow::Result<()> {
                         ))
                     );
                 }
+            } else if has_upstream {
+                eprintln!(
+                    "{}",
+                    warning_message(cformat!(
+                        "Kept remote branch <bold>{branch}</>: its merge hasn't reached the remote yet"
+                    ))
+                );
             }
 
             eprintln!(
@@ -978,7 +1024,7 @@ fn print_sync_plan(
     repo: &Repository,
     tree: &DependencyTree,
     branches: &[&str],
-    integrated: &[(String, PathBuf)],
+    integrated: &[IntegratedBranch],
     opts: &SyncOptions,
 ) {
     if opts.verbose && opts.fetch {
@@ -1054,7 +1100,12 @@ fn print_sync_plan(
         if opts.prune && !integrated.is_empty() {
             eprintln!();
             eprintln!("Prune:");
-            for (branch, path) in integrated {
+            for IntegratedBranch {
+                branch,
+                path,
+                merged_upstream,
+            } in integrated
+            {
                 let has_upstream = repo.branch(branch).upstream().ok().flatten().is_some();
                 let prune_remote = repo
                     .branch(branch)
@@ -1066,8 +1117,10 @@ fn print_sync_plan(
                     path.to_string_lossy()
                 );
                 eprintln!("    $ git branch -D {branch}");
-                if has_upstream {
+                if has_upstream && *merged_upstream {
                     eprintln!("    $ git push {prune_remote} --delete {branch}");
+                } else if has_upstream {
+                    eprintln!("    # keep {prune_remote}/{branch}: merge not on the remote yet");
                 }
             }
         }

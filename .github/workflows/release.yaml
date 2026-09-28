@@ -17,6 +17,9 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      # worktrunk requires rustc >= 1.97 (see rust-version in Cargo.toml)
+      - uses: dtolnay/rust-toolchain@stable
+
       - uses: Swatinem/rust-cache@v2
 
       - name: Build
