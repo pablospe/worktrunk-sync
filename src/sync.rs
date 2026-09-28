@@ -649,7 +649,12 @@ pub fn handle_sync(opts: SyncOptions) -> anyhow::Result<()> {
     };
 
     if branches_to_sync.is_empty() && (!opts.prune || integrated.is_empty()) {
-        eprintln!("{}", success_message("All branches are up to date."));
+        let msg = if opts.push_only {
+            "No branches to push."
+        } else {
+            "All branches are up to date."
+        };
+        eprintln!("{}", success_message(msg));
         return Ok(());
     }
 
