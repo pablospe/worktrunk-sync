@@ -33,6 +33,7 @@ The binary is named `wt-sync` and can be run directly. If [worktrunk](https://gi
 wt-sync              # sync the current stack (default)
 wt-sync --all        # sync all stacks
 wt-sync -nv          # preview the plan with git commands
+wt-sync --push-only  # push the current stack without rebasing
 
 # Or via worktrunk:
 wt sync
@@ -47,6 +48,15 @@ wt sync --fetch --push --prune
 
 This fetches from the remote, rebases branches in the current stack, pushes the rebased branches, and removes any worktrees whose branches have been merged.
 
+### Push only
+
+```bash
+wt sync --push-only        # current stack
+wt sync --push-only --all  # every stack
+```
+
+Pushes each branch in the selected scope as-is (`git push --force-with-lease`), in dependency order, without fetching or rebasing. Branches without an upstream are skipped, just like with `--push`. Worktrees don't need to be clean, and the stack/fork-point files are left untouched. Combine with `-nv` to preview the push commands. Cannot be combined with `--fetch` or `--prune`.
+
 ### Flags
 
 | Flag | Short | Description |
@@ -55,6 +65,7 @@ This fetches from the remote, rebases branches in the current stack, pushes the 
 | `--all` | `-a` | Sync all stacks |
 | `--fetch` | `-f` | Fetch from remote before syncing |
 | `--push` | `-p` | Push rebased branches after syncing |
+| `--push-only` | | Push the stack as-is, without fetching or rebasing |
 | `--prune` | `-P` | Remove integrated worktrees after syncing |
 | `--force` | `-F` | Force removal of dirty integrated worktrees (with `--prune`) |
 | `--verbose` | `-v` | Show git commands that would be executed |

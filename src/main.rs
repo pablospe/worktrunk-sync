@@ -37,6 +37,13 @@ struct Cli {
     #[arg(long = "no-push", overrides_with = "push", hide = true)]
     no_push: bool,
 
+    /// Push the stack as-is, without fetching or rebasing
+    ///
+    /// Pushes every branch in the selected scope (current stack, or all with
+    /// `--all`) that has an upstream, in dependency order.
+    #[arg(long, conflicts_with_all = ["fetch", "no_push", "prune"])]
+    push_only: bool,
+
     /// Remove integrated worktrees after syncing
     #[arg(short = 'P', long, overrides_with = "no_prune")]
     prune: bool,
@@ -85,6 +92,7 @@ fn main() {
         fetch: flag_pair(args.fetch, args.no_fetch).unwrap_or(false),
         all,
         push: flag_pair(args.push, args.no_push).unwrap_or(false),
+        push_only: args.push_only,
         prune: flag_pair(args.prune, args.no_prune).unwrap_or(false),
         force: args.force,
         verbose: args.verbose,
@@ -98,5 +106,32 @@ fn main() {
             eprintln!("  caused by: {cause}");
         }
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_push_only_parses() {
+        let args = Cli::try_parse_from(["wt-sync", "--push-only", "--all", "-nv"]).unwrap();
+        assert!(args.push_only);
+        assert!(args.all);
+    }
+
+    #[test]
+    fn test_push_only_conflicts() {
+        for flag in ["--fetch", "--prune", "--no-push"] {
+            assert!(
+                Cli::try_parse_from(["wt-sync", "--push-only", flag]).is_err(),
+                "--push-only should conflict with {flag}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_cli_debug_assert() {
+        Cli::command().debug_assert();
     }
 }
