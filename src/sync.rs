@@ -20,6 +20,7 @@
 //! - By default, syncs only the current stack
 //! - `--all` syncs every worktree branch
 //! - `--dry-run` previews the plan without executing
+//! - `--push-only` pushes the stack as-is, without fetching or rebasing
 //! - Stops on first conflict; user resolves and re-runs
 
 use std::collections::HashMap;
@@ -135,6 +136,8 @@ pub struct SyncOptions {
     pub fetch: bool,
     pub all: bool,
     pub push: bool,
+    /// Push the selected branches as-is, skipping fetch and rebase.
+    pub push_only: bool,
     pub prune: bool,
     pub force: bool,
     pub verbose: bool,
@@ -509,7 +512,7 @@ fn build_dependency_tree(
     // non-integrated ancestor. With a stack file, this uses the explicit parent
     // chain (e.g., pr2 integrated into pr1 → pr3 reparents to pr1). Without a
     // stack file, falls back to the default branch.
-    for (_branch, (parent, original_parent)) in parent_map.iter_mut() {
+    for (parent, original_parent) in parent_map.values_mut() {
         if integrated.contains_key(parent.as_str()) {
             let old_parent = parent.clone();
             // Walk up the tree to find the first non-integrated ancestor.
@@ -646,13 +649,33 @@ pub fn handle_sync(opts: SyncOptions) -> anyhow::Result<()> {
     };
 
     if branches_to_sync.is_empty() && (!opts.prune || integrated.is_empty()) {
-        eprintln!("{}", success_message("All branches are up to date."));
+        let msg = if opts.push_only {
+            "No branches to push."
+        } else {
+            "All branches are up to date."
+        };
+        eprintln!("{}", success_message(msg));
         return Ok(());
     }
 
     // Dry-run mode: show plan and exit
     if opts.dry_run {
         print_sync_plan(&repo, &tree, &branches_to_sync, &integrated, &opts);
+        return Ok(());
+    }
+
+    // Push-only mode: no rebase, so no worktree safety checks or state updates
+    if opts.push_only {
+        let (attempted, failed) = push_branches(&repo, &branches_to_sync);
+        if attempted == 0 {
+            eprintln!(
+                "{}",
+                success_message("No branches with an upstream to push.")
+            );
+        }
+        if failed > 0 {
+            bail!("{failed} of {attempted} pushes failed");
+        }
         return Ok(());
     }
 
@@ -814,36 +837,7 @@ pub fn handle_sync(opts: SyncOptions) -> anyhow::Result<()> {
 
     // Push all branches with an upstream
     if opts.push {
-        let pushable: Vec<&str> = branches_to_sync
-            .iter()
-            .filter(|b| repo.branch(b).upstream().ok().flatten().is_some())
-            .copied()
-            .collect();
-        if !pushable.is_empty() {
-            eprintln!();
-        }
-        for branch in &pushable {
-            let remote = repo
-                .branch(branch)
-                .push_remote()
-                .unwrap_or_else(|| "origin".to_string());
-            eprintln!(
-                "{}",
-                progress_message(cformat!("Pushing <bold>{branch}</> to {remote}..."))
-            );
-            let result = repo.run_command(&["push", "--force-with-lease", &remote, branch]);
-            match result {
-                Ok(_) => {
-                    eprintln!("{}", success_message(cformat!("Pushed <bold>{branch}</>")));
-                }
-                Err(e) => {
-                    eprintln!(
-                        "{}",
-                        error_message(cformat!("Failed to push <bold>{branch}</>: {e}"))
-                    );
-                }
-            }
-        }
+        push_branches(&repo, &branches_to_sync);
     }
 
     // Prune integrated worktrees
@@ -934,6 +928,51 @@ pub fn handle_sync(opts: SyncOptions) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Branches that have an upstream, paired with the remote to push them to.
+fn push_targets(repo: &Repository, branches: &[&str]) -> Vec<(String, String)> {
+    branches
+        .iter()
+        .filter(|b| repo.branch(b).upstream().ok().flatten().is_some())
+        .map(|&b| {
+            let remote = repo
+                .branch(b)
+                .push_remote()
+                .unwrap_or_else(|| "origin".to_string());
+            (b.to_string(), remote)
+        })
+        .collect()
+}
+
+/// Force-push (with lease) every branch that has an upstream, in the given order.
+/// Returns `(attempted, failed)` push counts.
+fn push_branches(repo: &Repository, branches: &[&str]) -> (usize, usize) {
+    let targets = push_targets(repo, branches);
+    let mut failed = 0;
+    if !targets.is_empty() {
+        eprintln!();
+    }
+    for (branch, remote) in &targets {
+        eprintln!(
+            "{}",
+            progress_message(cformat!("Pushing <bold>{branch}</> to {remote}..."))
+        );
+        let result = repo.run_command(&["push", "--force-with-lease", remote, branch]);
+        match result {
+            Ok(_) => {
+                eprintln!("{}", success_message(cformat!("Pushed <bold>{branch}</>")));
+            }
+            Err(e) => {
+                failed += 1;
+                eprintln!(
+                    "{}",
+                    error_message(cformat!("Failed to push <bold>{branch}</>: {e}"))
+                );
+            }
+        }
+    }
+    (targets.len(), failed)
+}
+
 /// Print the sync plan (dry-run mode).
 fn print_sync_plan(
     repo: &Repository,
@@ -951,10 +990,24 @@ fn print_sync_plan(
     eprintln!("Dependency tree:");
     print_tree_node(tree, &tree.root, "", true, true);
 
-    let fork_points = load_fork_points(repo);
-
     eprintln!();
     eprintln!("Planned operations:");
+
+    if opts.push_only {
+        let targets = push_targets(repo, branches);
+        if targets.is_empty() {
+            eprintln!("  (none)");
+        }
+        for (branch, remote) in &targets {
+            eprintln!("  push {branch} to {remote}");
+            if opts.verbose {
+                eprintln!("    $ git push --force-with-lease {remote} {branch}");
+            }
+        }
+        return;
+    }
+
+    let fork_points = load_fork_points(repo);
     let mut has_ops = false;
     for &branch in branches {
         let Some(node) = tree.nodes.get(branch) else {
@@ -989,19 +1042,11 @@ fn print_sync_plan(
 
     if opts.verbose {
         if opts.push {
-            let pushable: Vec<&str> = branches
-                .iter()
-                .filter(|b| repo.branch(b).upstream().ok().flatten().is_some())
-                .copied()
-                .collect();
-            if !pushable.is_empty() {
+            let targets = push_targets(repo, branches);
+            if !targets.is_empty() {
                 eprintln!();
                 eprintln!("Push:");
-                for branch in &pushable {
-                    let remote = repo
-                        .branch(branch)
-                        .push_remote()
-                        .unwrap_or_else(|| "origin".to_string());
+                for (branch, remote) in &targets {
                     eprintln!("    $ git push --force-with-lease {remote} {branch}");
                 }
             }

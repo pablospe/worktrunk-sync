@@ -12,6 +12,8 @@
 #   4. PR1 squash-merged to main → reparent with --onto
 #   5. PR3 squash-merged into PR2 (non-default branch merge) → detected!
 #   6. --push with deleted remote branches
+#   7. --prune removes integrated worktrees
+#   8. --push-only pushes the stack without rebasing
 #
 # Stack: main <- pr1 <- pr2 <- pr3 <- pr4 <- pr5
 #
@@ -442,6 +444,46 @@ check "pr2 worktree directory removed" "! [[ -d ${WORK_DIR}/repo.pr2 ]]"
 check "pr2 remote branch deleted" "! git ls-remote --exit-code origin pr2 &>/dev/null"
 
 # ═══════════════════════════════════════════════════════════════════════════
+# Test 8: --push-only pushes the stack without rebasing
+# ═══════════════════════════════════════════════════════════════════════════
+
+echo ""
+echo -e "${bold}═══ Test 8: --push-only pushes the stack without rebasing ═══${reset}"
+
+# Current stack: main ← pr4 ← pr5
+# Advance main locally so a regular sync would rebase, then add unpushed
+# commits to pr4 and pr5.
+info "Advancing main locally and adding unpushed commits to pr4 and pr5"
+cd "${REPO_DIR}"
+echo "func Health() {}" > health.go
+git add health.go && git commit -m "main: add health check"
+cd "${WORK_DIR}/repo.pr4"
+echo "// pr4 follow-up" >> login.go
+git add login.go && git commit -m "pr4: follow-up"
+cd "${WORK_DIR}/repo.pr5"
+echo "// pr5 follow-up" >> middleware.go
+git add middleware.go && git commit -m "pr5: follow-up"
+
+PR4_BASE_BEFORE=$(git merge-base main pr4)
+PR4_REMOTE_BEFORE=$(git ls-remote origin pr4 | cut -f1)
+
+info "Running: wt sync --push-only -nv (dry run)"
+separator
+wt sync --push-only -nv 2>&1
+separator
+check "Dry run does not push pr4" "[[ \"$(git ls-remote origin pr4 | cut -f1)\" == \"${PR4_REMOTE_BEFORE}\" ]]"
+
+info "Running: wt sync --push-only"
+separator
+wt sync --push-only 2>&1
+separator
+
+check "pr4 pushed to remote" "[[ \"$(git ls-remote origin pr4 | cut -f1)\" == \"$(git rev-parse pr4)\" ]]"
+check "pr5 pushed to remote" "[[ \"$(git ls-remote origin pr5 | cut -f1)\" == \"$(git rev-parse pr5)\" ]]"
+check "pr4 was not rebased onto new main" "[[ \"$(git merge-base main pr4)\" == \"${PR4_BASE_BEFORE}\" ]]"
+check "--push-only rejects --fetch" "! wt sync --push-only --fetch &>/dev/null"
+
+# ═══════════════════════════════════════════════════════════════════════════
 # Summary
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -457,6 +499,7 @@ echo "Test 4: PR1 squash-merged to main → reparent"
 echo "Test 5: PR3 merged into PR2 (non-default branch detection)"
 echo "Test 6: --push with deleted remote branches"
 echo "Test 7: --prune removes integrated worktrees and remote branches"
+echo "Test 8: --push-only pushes the stack without rebasing"
 echo ""
 
 # Exit with failure if any tests failed
