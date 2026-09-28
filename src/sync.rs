@@ -29,7 +29,10 @@ use std::path::PathBuf;
 use anyhow::{bail, Context};
 use color_print::cformat;
 
-use worktrunk::git::{remove_worktree_with_cleanup, BranchDeletionMode, RemoveOptions, Repository};
+use worktrunk::git::{
+    remove_worktree_with_cleanup, BranchDeletionMode, InProgressOperation, RemoveOptions,
+    Repository,
+};
 use worktrunk::styling::{
     eprintln, error_message, hint_message, progress_message, success_message, warning_message,
 };
@@ -305,7 +308,7 @@ fn build_dependency_tree(
 
     // Collect branches with worktrees, filtering detached/bare
     let mut branches: Vec<(String, PathBuf)> = Vec::new();
-    for wt in &worktrees {
+    for wt in worktrees {
         if wt.bare || wt.detached {
             continue;
         }
@@ -329,8 +332,10 @@ fn build_dependency_tree(
     // With a stack file, we also check against each branch's explicit parent,
     // which detects merges between non-default branches (e.g., PR2 squash-merged
     // into PR1).
-    let integration_target = repo.integration_target();
-    let target_ref = integration_target.as_deref().unwrap_or(&default_branch);
+    //
+    // `integration_reason` resolves the target's upstream itself, so passing the
+    // local default branch also catches branches merged only on the remote.
+    let snapshot = repo.capture_refs()?;
 
     let mut integrated: HashMap<String, PathBuf> = HashMap::new();
 
@@ -354,7 +359,7 @@ fn build_dependency_tree(
         if branch == &default_branch {
             continue;
         }
-        let (_, reason) = repo.integration_reason(branch, target_ref)?;
+        let (_, reason) = repo.integration_reason(&snapshot, branch, &default_branch)?;
         if reason.is_some() {
             integrated.insert(branch.clone(), path.clone());
         }
@@ -369,8 +374,8 @@ fn build_dependency_tree(
                 continue;
             }
             if let Some(parent) = explicit_parents.get(branch) {
-                if parent != target_ref && local_branches.contains(parent.as_str()) {
-                    let (_, reason) = repo.integration_reason(branch, parent)?;
+                if parent != &default_branch && local_branches.contains(parent.as_str()) {
+                    let (_, reason) = repo.integration_reason(&snapshot, branch, parent)?;
                     if reason.is_some() {
                         integrated.insert(branch.clone(), path.clone());
                     }
@@ -472,12 +477,12 @@ fn build_dependency_tree(
 
             if tie_candidates.len() > 1 {
                 let mb_shas: Vec<&str> = tie_candidates.iter().map(|(_, mb)| mb.as_str()).collect();
-                let timestamps = repo.commit_timestamps(&mb_shas)?;
+                let commits = repo.commit_details_many(&mb_shas)?;
 
                 let mut best_ts = i64::MIN;
                 let mut resolved_parent: Option<&str> = None;
                 for (candidate, mb) in &tie_candidates {
-                    if let Some(&ts) = timestamps.get(mb.as_str()) {
+                    if let Some(&(_, ts, _)) = commits.get(mb.as_str()) {
                         if ts > best_ts {
                             best_ts = ts;
                             resolved_parent = Some(candidate);
@@ -708,7 +713,7 @@ pub fn handle_sync(opts: SyncOptions) -> anyhow::Result<()> {
     for &branch in &branches_to_sync {
         if let Some(node) = tree.nodes.get(branch) {
             let wt = repo.worktree_at(&node.path);
-            if wt.is_rebasing()? {
+            if wt.operation_in_progress()? == Some(InProgressOperation::Rebase) {
                 return Err(anyhow::anyhow!(
                     "Resolve it with `git rebase --continue` or `git rebase --abort` first."
                 ))
@@ -789,7 +794,7 @@ pub fn handle_sync(opts: SyncOptions) -> anyhow::Result<()> {
 
         let result = wt.run_command(&["rebase", "--onto", parent, &rebase_base, branch]);
         if let Err(e) = result {
-            if wt.is_rebasing()? {
+            if wt.operation_in_progress()? == Some(InProgressOperation::Rebase) {
                 eprintln!(
                     "{}",
                     error_message(cformat!(
@@ -842,6 +847,8 @@ pub fn handle_sync(opts: SyncOptions) -> anyhow::Result<()> {
 
     // Prune integrated worktrees
     if opts.prune && !integrated.is_empty() {
+        // Fresh snapshot: the rebase/push phases above may have moved refs.
+        let snapshot = repo.capture_refs()?;
         eprintln!();
         for (branch, path) in &integrated {
             eprintln!(
@@ -858,6 +865,7 @@ pub fn handle_sync(opts: SyncOptions) -> anyhow::Result<()> {
 
             let output = remove_worktree_with_cleanup(
                 &repo,
+                &snapshot,
                 path,
                 RemoveOptions {
                     branch: Some(branch.clone()),
