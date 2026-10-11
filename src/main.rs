@@ -1,6 +1,7 @@
 use clap::{CommandFactory, Parser};
 use clap_complete::env::CompleteEnv;
 
+mod parent_infer;
 mod sync;
 
 /// Rebase stacked worktree branches in dependency order.
