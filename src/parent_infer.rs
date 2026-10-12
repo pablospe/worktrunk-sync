@@ -144,44 +144,20 @@ pub fn infer_parents_pairwise<H: History>(
     default_branch: &str,
     skip: &HashSet<&str>,
 ) -> Result<InferredParents> {
-    let mut parents = HashMap::new();
-    let mut equidistant = Vec::new();
-
-    for branch in branches {
-        if *branch == default_branch || skip.contains(branch) {
-            continue;
-        }
-
-        let mut ranked = Vec::new();
-        for candidate in branches {
-            if *candidate == *branch {
-                continue;
-            }
-            let Some(mb) = history.merge_base(candidate, branch)? else {
-                continue;
+    rank_parents(
+        history,
+        branches,
+        default_branch,
+        skip,
+        |branch, candidate| {
+            let Some(merge_base) = history.merge_base(candidate, branch)? else {
+                return Ok(None);
             };
-            let branch_depth = history.count_commits(&mb, branch)?;
-            if branch_depth == 0 {
-                continue;
-            }
-            let candidate_depth = history.count_commits(&mb, candidate)?;
-            ranked.push(RankedParent {
-                name: (*candidate).to_string(),
-                merge_base: mb,
-                branch_depth,
-                candidate_depth,
-            });
-        }
-
-        if let Some(pick) = select_parent(&ranked, history)? {
-            record_pick(branch, pick, &mut parents, &mut equidistant);
-        }
-    }
-
-    Ok(InferredParents {
-        parents,
-        equidistant,
-    })
+            let branch_depth = history.count_commits(&merge_base, branch)?;
+            let candidate_depth = history.count_commits(&merge_base, candidate)?;
+            Ok(Some((merge_base, branch_depth, candidate_depth)))
+        },
+    )
 }
 
 /// `None` means the dump is over budget (or unusable); caller falls back.
@@ -196,49 +172,33 @@ fn infer_from_dump<H: History>(
     let tip_shas = history.resolve_shas(&dump_refs)?;
     let dump =
         history.rev_list_parents(&tip_shas.iter().map(String::as_str).collect::<Vec<_>>())?;
-    let graph = CommitGraph::parse(&dump);
-
-    let tip_count = dump_refs.len();
-    if graph.len() > budget.max_commits
-        || bitset_bytes(tip_count, graph.len()) > budget.max_bitset_bytes
-    {
+    let Some(graph) = CommitGraph::parse(&dump, dump_refs.len(), budget) else {
         return Ok(None);
-    }
-
-    let mut tip_index = Vec::with_capacity(branches.len());
-    let mut branch_shas = Vec::with_capacity(branches.len());
-    for branch in branches {
-        let pos = dump_refs
-            .iter()
-            .position(|r| *r == *branch)
-            .expect("dump_refs contains every branch");
-        let sha = &tip_shas[pos];
-        let Some(idx) = graph.index.get(sha).copied() else {
-            return Ok(None);
-        };
-        tip_index.push(idx);
-        branch_shas.push(sha.clone());
-    }
-
+    };
+    let Some((tip_index, branch_shas)) =
+        branch_tips_in_dump(&graph, &dump_refs, &tip_shas, branches)
+    else {
+        return Ok(None);
+    };
     let bits: Vec<Bitset> = tip_index
         .iter()
         .map(|&idx| graph.ancestor_bits(idx))
         .collect();
+    let position: HashMap<&str, usize> = branches
+        .iter()
+        .enumerate()
+        .map(|(index, name)| (*name, index))
+        .collect();
 
-    let mut parents = HashMap::new();
-    let mut equidistant = Vec::new();
-
-    for (b_i, branch) in branches.iter().enumerate() {
-        if *branch == default_branch || skip.contains(branch) {
-            continue;
-        }
-
-        let mut ranked = Vec::new();
-        for (c_i, candidate) in branches.iter().enumerate() {
-            if c_i == b_i {
-                continue;
-            }
-            let Some(mb) = merge_base_for_pair(
+    let inferred = rank_parents(
+        history,
+        branches,
+        default_branch,
+        skip,
+        |branch, candidate| {
+            let b_i = position[branch];
+            let c_i = position[candidate];
+            let Some(merge_base) = merge_base_for_pair(
                 history,
                 &graph,
                 &bits[b_i],
@@ -247,17 +207,70 @@ fn infer_from_dump<H: History>(
                 &branch_shas[c_i],
             )?
             else {
-                continue;
+                return Ok(None);
             };
-            let Some((branch_depth, candidate_depth)) = pair_depths(
+            let (branch_depth, candidate_depth) = pair_depths(
                 history,
                 &graph,
                 tip_index[b_i],
                 tip_index[c_i],
-                &mb,
+                &merge_base,
                 branch,
                 candidate,
-            )?
+            )?;
+            Ok(Some((merge_base, branch_depth, candidate_depth)))
+        },
+    )?;
+    Ok(Some(inferred))
+}
+
+/// Index and SHA of each branch tip. `None` when a tip SHA is missing from the dump.
+fn branch_tips_in_dump(
+    graph: &CommitGraph,
+    dump_refs: &[&str],
+    tip_shas: &[String],
+    branches: &[&str],
+) -> Option<(Vec<usize>, Vec<String>)> {
+    let mut tip_index = Vec::with_capacity(branches.len());
+    let mut branch_shas = Vec::with_capacity(branches.len());
+    for branch in branches {
+        let pos = dump_refs
+            .iter()
+            .position(|name| *name == *branch)
+            .expect("dump_refs contains every branch");
+        let sha = &tip_shas[pos];
+        let idx = graph.index.get(sha).copied()?;
+        tip_index.push(idx);
+        branch_shas.push(sha.clone());
+    }
+    Some((tip_index, branch_shas))
+}
+
+fn rank_parents<H, F>(
+    history: &H,
+    branches: &[&str],
+    default_branch: &str,
+    skip: &HashSet<&str>,
+    mut measure: F,
+) -> Result<InferredParents>
+where
+    H: History,
+    F: FnMut(&str, &str) -> Result<Option<(String, usize, usize)>>,
+{
+    let mut parents = HashMap::new();
+    let mut equidistant = Vec::new();
+
+    for branch in branches {
+        if *branch == default_branch || skip.contains(branch) {
+            continue;
+        }
+
+        let mut ranked = Vec::new();
+        for candidate in branches {
+            if *candidate == *branch {
+                continue;
+            }
+            let Some((merge_base, branch_depth, candidate_depth)) = measure(branch, candidate)?
             else {
                 continue;
             };
@@ -266,7 +279,7 @@ fn infer_from_dump<H: History>(
             }
             ranked.push(RankedParent {
                 name: (*candidate).to_string(),
-                merge_base: mb,
+                merge_base,
                 branch_depth,
                 candidate_depth,
             });
@@ -277,10 +290,10 @@ fn infer_from_dump<H: History>(
         }
     }
 
-    Ok(Some(InferredParents {
+    Ok(InferredParents {
         parents,
         equidistant,
-    }))
+    })
 }
 
 fn dump_refs<'a>(branches: &'a [&'a str], default_branch: &'a str) -> Vec<&'a str> {
@@ -318,17 +331,17 @@ fn pair_depths<H: History>(
     mb_sha: &str,
     head: &str,
     candidate: &str,
-) -> Result<Option<(usize, usize)>> {
+) -> Result<(usize, usize)> {
     if let Some(mb_idx) = graph.index.get(mb_sha).copied() {
-        return Ok(Some((
+        return Ok((
             graph.count_ahead(head_idx, mb_idx),
             graph.count_ahead(candidate_idx, mb_idx),
-        )));
+        ));
     }
-    Ok(Some((
+    Ok((
         history.count_commits(mb_sha, head)?,
         history.count_commits(mb_sha, candidate)?,
-    )))
+    ))
 }
 
 struct RankedParent {
@@ -343,9 +356,10 @@ struct ParentPick {
     equidistant: Vec<String>,
 }
 
-/// Two-tier pick: true ancestors (candidate_depth == 0) win by smallest
-/// branch_depth; else diverged by (branch_depth, candidate_depth). Ties break
-/// on merge-base committer timestamp (newest wins).
+/// A sibling forked from the parent tip shares `branch_depth` and the merge-base
+/// commit; only `candidate_depth == 0` keeps that parent, because sorting by
+/// `branch_depth` alone lets the sibling win on list order. Equal ranks keep the
+/// candidate whose merge-base committer timestamp is newest.
 fn select_parent<H: History>(ranked: &[RankedParent], history: &H) -> Result<Option<ParentPick>> {
     let mut ancestors: Vec<&RankedParent> =
         ranked.iter().filter(|r| r.candidate_depth == 0).collect();
@@ -440,8 +454,31 @@ struct CommitGraph {
     parents: Vec<Vec<usize>>,
 }
 
+/// `None` once the next commit would exceed [`MemoryBudget`].
+fn insert_commit(
+    index: &mut HashMap<String, usize>,
+    shas: &mut Vec<String>,
+    parent_names: &mut Vec<Vec<String>>,
+    sha: &str,
+    tips: usize,
+    budget: MemoryBudget,
+) -> Option<usize> {
+    if let Some(&existing) = index.get(sha) {
+        return Some(existing);
+    }
+    let next = shas.len() + 1;
+    if next > budget.max_commits || bitset_bytes(tips, next) > budget.max_bitset_bytes {
+        return None;
+    }
+    let idx = shas.len();
+    index.insert(sha.to_string(), idx);
+    shas.push(sha.to_string());
+    parent_names.push(Vec::new());
+    Some(idx)
+}
+
 impl CommitGraph {
-    fn parse(dump: &str) -> Self {
+    fn parse(dump: &str, tips: usize, budget: MemoryBudget) -> Option<Self> {
         let mut index = HashMap::new();
         let mut shas = Vec::new();
         let mut parent_names: Vec<Vec<String>> = Vec::new();
@@ -451,37 +488,31 @@ impl CommitGraph {
             let Some(sha) = parts.next() else {
                 continue;
             };
-            if !index.contains_key(sha) {
-                index.insert(sha.to_string(), shas.len());
-                shas.push(sha.to_string());
-                parent_names.push(Vec::new());
-            }
-            let idx = index[sha];
+            let idx = insert_commit(&mut index, &mut shas, &mut parent_names, sha, tips, budget)?;
             let listed: Vec<String> = parts.map(ToOwned::to_owned).collect();
             for parent in &listed {
-                if !index.contains_key(parent) {
-                    index.insert(parent.clone(), shas.len());
-                    shas.push(parent.clone());
-                    parent_names.push(Vec::new());
-                }
+                insert_commit(
+                    &mut index,
+                    &mut shas,
+                    &mut parent_names,
+                    parent,
+                    tips,
+                    budget,
+                )?;
             }
             parent_names[idx] = listed;
         }
 
         let parents = parent_names
             .into_iter()
-            .map(|names| names.into_iter().map(|p| index[&p]).collect())
+            .map(|names| names.into_iter().map(|name| index[&name]).collect())
             .collect();
 
-        Self {
+        Some(Self {
             index,
             shas,
             parents,
-        }
-    }
-
-    fn len(&self) -> usize {
-        self.shas.len()
+        })
     }
 
     fn ancestor_bits(&self, tip: usize) -> Bitset {
@@ -552,7 +583,6 @@ impl CommitGraph {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeMap;
     use std::path::{Path, PathBuf};
     use std::process::Command;
 
@@ -621,11 +651,6 @@ mod tests {
 
         let dump = infer_parents(&repo, &branches, "main", &skip, MemoryBudget::default()).unwrap();
         let pair = infer_parents_pairwise(&repo, &branches, "main", &skip).unwrap();
-
-        let dump_map: BTreeMap<_, _> = dump.parents.iter().collect();
-        let pair_map: BTreeMap<_, _> = pair.parents.iter().collect();
-        println!("dump-first: {dump_map:?}");
-        println!("pairwise:   {pair_map:?}");
 
         assert_eq!(dump.parents, pair.parents);
         assert_eq!(dump.parents.get("pr1").map(String::as_str), Some("main"));
@@ -737,10 +762,23 @@ mod tests {
 
     #[test]
     fn parse_dump_counts_unique_commits_and_dangling_parents() {
-        let graph = CommitGraph::parse("c1 p1 p2\np1 root\nroot\n");
-        assert_eq!(graph.len(), 4); // c1, p1, p2 (dangling), root
+        let graph = CommitGraph::parse("c1 p1 p2\np1 root\nroot\n", 1, MemoryBudget::default())
+            .expect("dump fits the budget");
+        assert_eq!(graph.shas.len(), 4); // c1, p1, p2 (dangling), root
         assert!(graph.index.contains_key("p2"));
         assert!(graph.parents[graph.index["p2"]].is_empty());
+    }
+
+    #[test]
+    fn parse_returns_none_once_the_next_commit_exceeds_budget() {
+        let dump = "c1\nroot\n";
+        let over = MemoryBudget {
+            max_commits: 1,
+            max_bitset_bytes: MAX_BITSET_BYTES,
+        };
+        assert!(CommitGraph::parse(dump, 2, over).is_none());
+        let graph = CommitGraph::parse(dump, 2, MemoryBudget::default()).expect("within budget");
+        assert_eq!(graph.shas.len(), 2);
     }
 
     struct FakeHistory {
@@ -748,6 +786,7 @@ mod tests {
         dump: String,
         merge_bases: HashMap<(String, String), Option<String>>,
         timestamps: HashMap<String, i64>,
+        counts: HashMap<(String, String), usize>,
         merge_base_calls: std::cell::Cell<usize>,
     }
 
@@ -777,8 +816,11 @@ mod tests {
             Ok(self.merge_bases.get(&key).cloned().flatten())
         }
 
-        fn count_commits(&self, _base: &str, _head: &str) -> Result<usize> {
-            bail!("count_commits should not run on the dump path");
+        fn count_commits(&self, base: &str, head: &str) -> Result<usize> {
+            match self.counts.get(&(base.to_string(), head.to_string())) {
+                Some(count) => Ok(*count),
+                None => bail!("count_commits should not run on the dump path"),
+            }
         }
 
         fn commit_details_many(
@@ -818,6 +860,7 @@ root
                 Some("asha".into()),
             )]),
             timestamps: HashMap::new(),
+            counts: HashMap::new(),
             merge_base_calls: std::cell::Cell::new(0),
         };
         let branches = ["main", "left", "right"];
@@ -834,5 +877,163 @@ root
             inferred.parents.get("right").map(String::as_str),
             Some("main")
         );
+    }
+
+    fn assert_parent(repo: &Path, branches: &[&str], child: &str, parent: &str) {
+        let git_repo = Repository::at(repo).unwrap();
+        let skip = HashSet::new();
+        let dump =
+            infer_parents(&git_repo, branches, "main", &skip, MemoryBudget::default()).unwrap();
+        let pair = infer_parents_pairwise(&git_repo, branches, "main", &skip).unwrap();
+        assert_eq!(dump.parents, pair.parents);
+        assert_eq!(dump.parents.get(child).map(String::as_str), Some(parent));
+    }
+
+    #[test]
+    fn sibling_at_parent_tip_does_not_steal_child() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo);
+        commit(&repo, "main.txt", "main");
+        git(&repo, &["checkout", "-b", "pr1"]);
+        commit(&repo, "pr1.txt", "pr1");
+        git(&repo, &["checkout", "-b", "pr2"]);
+        commit(&repo, "pr2.txt", "pr2");
+        git(&repo, &["checkout", "pr1"]);
+        git(&repo, &["checkout", "-b", "side"]);
+        commit(&repo, "side.txt", "side");
+
+        assert_parent(&repo, &["main", "side", "pr1", "pr2"], "pr2", "pr1");
+    }
+
+    #[test]
+    fn closer_diverged_sibling_loses_to_ancestor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo);
+        commit(&repo, "root.txt", "root");
+        commit(&repo, "main.txt", "main");
+        git(&repo, &["checkout", "-b", "topic"]);
+        commit(&repo, "t1.txt", "t1");
+        commit(&repo, "t2.txt", "t2");
+        commit(&repo, "t3.txt", "t3");
+        git(&repo, &["checkout", "-b", "side", "HEAD~1"]);
+        commit(&repo, "side.txt", "side");
+
+        assert_parent(&repo, &["side", "main", "topic"], "topic", "main");
+    }
+
+    #[test]
+    fn diverged_branch_prefers_closer_candidate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo);
+        commit(&repo, "root.txt", "root");
+        git(&repo, &["checkout", "-b", "a"]);
+        commit(&repo, "a1.txt", "a1");
+        commit(&repo, "a2.txt", "a2");
+        git(&repo, &["checkout", "main"]);
+        commit(&repo, "main.txt", "main");
+        git(&repo, &["checkout", "-b", "b", "HEAD~1"]);
+        commit(&repo, "b.txt", "b");
+
+        assert_parent(&repo, &["a", "main", "b"], "b", "main");
+    }
+
+    fn criss_cross_history(child_cross_base: &str) -> FakeHistory {
+        let dump = "\
+child basenear basefar
+cross basefar basenear
+basenear extra root
+basefar root
+extra root
+rival r1
+r1 basefar
+main m1
+m1 root
+root
+";
+        FakeHistory {
+            names: HashMap::from([
+                ("main".into(), "main".into()),
+                ("child".into(), "child".into()),
+                ("cross".into(), "cross".into()),
+                ("rival".into(), "rival".into()),
+            ]),
+            dump: dump.to_string(),
+            merge_bases: HashMap::from([(
+                ("child".into(), "cross".into()),
+                Some(child_cross_base.to_string()),
+            )]),
+            timestamps: HashMap::new(),
+            counts: HashMap::new(),
+            merge_base_calls: std::cell::Cell::new(0),
+        }
+    }
+
+    #[test]
+    fn criss_cross_merge_base_sha_changes_winner() {
+        let branches = ["main", "child", "cross", "rival"];
+        let skip = HashSet::new();
+
+        let basenear = criss_cross_history("basenear");
+        let near =
+            infer_parents(&basenear, &branches, "main", &skip, MemoryBudget::default()).unwrap();
+        assert!(basenear.merge_base_calls.get() > 0);
+        assert_eq!(near.parents.get("child").map(String::as_str), Some("cross"));
+
+        let basefar = criss_cross_history("basefar");
+        let far =
+            infer_parents(&basefar, &branches, "main", &skip, MemoryBudget::default()).unwrap();
+        assert!(basefar.merge_base_calls.get() > 0);
+        assert_eq!(far.parents.get("child").map(String::as_str), Some("rival"));
+    }
+
+    #[test]
+    fn over_budget_fallback_disagrees_with_in_budget_dump() {
+        let dump = "\
+child near
+near root
+far farcommit
+farcommit root
+root
+";
+        let history = FakeHistory {
+            names: HashMap::from([
+                ("main".into(), "root".into()),
+                ("child".into(), "child".into()),
+                ("near".into(), "near".into()),
+                ("far".into(), "far".into()),
+            ]),
+            dump: dump.to_string(),
+            merge_bases: HashMap::from([(("child".into(), "far".into()), Some("root".into()))]),
+            timestamps: HashMap::new(),
+            counts: HashMap::from([
+                (("root".into(), "child".into()), 1),
+                (("root".into(), "far".into()), 4),
+            ]),
+            merge_base_calls: std::cell::Cell::new(0),
+        };
+        let branches = ["main", "child", "near", "far"];
+        let skip = HashSet::new();
+
+        let within =
+            infer_parents(&history, &branches, "main", &skip, MemoryBudget::default()).unwrap();
+        assert_eq!(
+            within.parents.get("child").map(String::as_str),
+            Some("near")
+        );
+
+        let tight = MemoryBudget {
+            max_commits: 1,
+            max_bitset_bytes: MAX_BITSET_BYTES,
+        };
+        let over = infer_parents(&history, &branches, "main", &skip, tight).unwrap();
+        let pair = infer_parents_pairwise(&history, &branches, "main", &skip).unwrap();
+        assert_eq!(over.parents.get("child").map(String::as_str), Some("far"));
+        assert_eq!(over.parents, pair.parents);
     }
 }

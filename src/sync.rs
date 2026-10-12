@@ -498,13 +498,6 @@ fn build_dependency_tree(
             parent_map.insert(branch.clone(), (parent, None));
         }
     } else {
-        // Infer parents from the commit graph. Dump-first: one
-        // `rev-list --parents` of the worktree tips plus the default branch,
-        // then the same two-tier pick as the old pairwise loop (true ancestors
-        // by smallest branch_depth, else diverged by (branch_depth,
-        // candidate_depth), timestamp tie-break). `git merge-base` only for
-        // criss-cross pairs; whole-tree pairwise only over the memory budget.
-        //
         // Limitation: after syncing + adding a mid-stack commit, the parent
         // branch becomes "diverged" and may lose to the default branch (a
         // true ancestor). The auto-saved stack file (`.git/wt/stack`) avoids
