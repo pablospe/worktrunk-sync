@@ -41,6 +41,11 @@ fn wt_sync(dir: &Path, args: &[&str]) -> (Output, String) {
         .current_dir(dir)
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("NO_COLOR", "1")
+        // The rebase commits need an identity; CI runners have none configured.
+        .env("GIT_AUTHOR_NAME", "Test")
+        .env("GIT_AUTHOR_EMAIL", "test@test.com")
+        .env("GIT_COMMITTER_NAME", "Test")
+        .env("GIT_COMMITTER_EMAIL", "test@test.com")
         .output()
         .expect("failed to run wt-sync");
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
