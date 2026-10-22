@@ -1336,12 +1336,19 @@ fn print_sync_plan(
             continue;
         };
 
-        // Same up-to-date check as the real run, against the parent's current tip.
-        let Ok(Some(mb)) = repo.merge_base(parent, branch) else {
+        // Same up-to-date check as the real run, against the parent's current
+        // tip. With a pending `--pull` fast-forward the real run moves the root
+        // first, so plan the root's children against the upstream tip it would
+        // move to rather than the stale local ref.
+        let parent_rev: &str = match pending_ff {
+            Some(ff) if parent == &tree.root => ff.upstream.as_str(),
+            _ => parent.as_str(),
+        };
+        let Ok(Some(mb)) = repo.merge_base(parent_rev, branch) else {
             continue;
         };
         let parent_sha = repo
-            .run_command(&["rev-parse", parent])
+            .run_command(&["rev-parse", parent_rev])
             .map(|s| s.trim().to_string())
             .unwrap_or_default();
         if mb == parent_sha {
