@@ -39,6 +39,11 @@ fn wt_sync(repo: &Path, args: &[&str]) -> (bool, String) {
         .args(args)
         .current_dir(repo)
         .env("GIT_TERMINAL_PROMPT", "0")
+        // The rebase wt-sync runs needs a committer identity; CI has none.
+        .env("GIT_AUTHOR_NAME", "Test")
+        .env("GIT_AUTHOR_EMAIL", "test@test.com")
+        .env("GIT_COMMITTER_NAME", "Test")
+        .env("GIT_COMMITTER_EMAIL", "test@test.com")
         .output()
         .expect("failed to run wt-sync");
     (
