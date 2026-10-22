@@ -30,6 +30,7 @@ The binary is named `wt-sync` and can be run directly. If [worktrunk](https://gi
 ## Usage
 
 ```bash
+wt-sync -upP         # day to day: pull main, rebase, push, prune merged
 wt-sync              # sync the current stack (default)
 wt-sync --all        # sync all stacks
 wt-sync -nv          # preview the plan with git commands
@@ -41,23 +42,40 @@ wt sync
 wt sync --all
 ```
 
-### Full workflow
+### Day to day
+
+Most of the time you want one command, run from any worktree in the stack you're working on:
 
 ```bash
-wt sync --pull --push --prune   # or: wt sync -upP
+wt sync -upP    # same as: wt sync --pull --push --prune
 ```
 
-This fetches from the remote, fast-forwards `main` to `origin/main`, rebases branches in the current stack onto it, pushes the rebased branches, and removes any worktrees whose branches have been merged.
+It fetches, fast-forwards `main` to `origin/main`, rebases the current stack onto it, pushes the rebased branches, and removes worktrees whose branches have been merged (so after a PR merges on GitHub, its worktree goes away and the branches above it move onto `main`).
+
+Add `-nv` to see what it would do first, and `--all` to do it for every stack instead of just the current one:
+
+```bash
+wt sync -upP -nv     # preview, with the git commands
+wt sync -upP --all   # every stack
+```
+
+Drop the flags you don't want: plain `wt sync` only rebases locally, without `-P` merged worktrees are kept, and without `-p` nothing is pushed. Nothing is on by default, because pulling, pushing and pruning all change things outside your current branch. If you type `-upP` all the time, a worktrunk [alias](https://worktrunk.dev/step/#aliases) saves the keystrokes:
+
+```toml
+# ~/.config/worktrunk/config.toml
+[aliases]
+ss = "wt-sync -upP"
+```
 
 ### Fetch vs pull
 
-`--fetch` only updates the remote-tracking refs (`origin/main`); branches are still rebased onto your local `main`. That is enough to detect branches merged on the remote, but if your local `main` is behind, the stack ends up rebased onto a stale base. `wt sync` now warns about that:
+`--fetch` only updates the remote-tracking refs (`origin/main`); branches are still rebased onto your local `main`. That is enough to detect branches merged on the remote, but if your local `main` is behind, the stack ends up rebased onto a stale base. `wt sync` warns about that:
 
 ```
 ⚠ main is 3 commits behind origin/main; run with --pull to update it
 ```
 
-`--pull` (`-u`) mirrors `git pull --ff-only` for the root: it fetches, then fast-forwards `main` to its upstream before the stack is rebased, so the rebase lands on what the remote actually has. Stacked branches are never touched by this step. The root is only moved when that's safe: if it is checked out, its worktree must be clean with no rebase or merge in progress; if it isn't checked out anywhere, only the ref moves. A root that has diverged from its upstream, has no upstream, or sits in a dirty worktree is left alone with a warning, and the sync continues as it would have without `--pull`. In `--dry-run` mode no fetch happens, so the preview is based on the remote-tracking refs you already have.
+`--pull` (`-u`) mirrors `git pull --ff-only` for the root: it fetches, then fast-forwards `main` to its upstream before the stack is rebased, so the rebase lands on what the remote actually has. Stacked branches are never touched by this step. The root is only moved when that's safe: its worktree must be clean with no rebase or merge in progress. A root that has diverged from its upstream, has no upstream, or sits in a dirty worktree is left alone with a warning, and the sync continues as it would have without `--pull`. In `--dry-run` mode no fetch happens, so the preview is based on the remote-tracking refs you already have.
 
 ### Push only
 
