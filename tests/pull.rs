@@ -175,33 +175,25 @@ fn pull_rebases_stack_onto_updated_root() {
 }
 
 #[test]
-fn pull_fast_forwards_root_not_checked_out() {
+fn pull_fails_before_fetching_when_root_not_checked_out() {
     let tmp = tempfile::tempdir().unwrap();
     let fx = setup(tmp.path(), 1);
-    let target = sha(&fx.publisher, "main");
+    let stale = sha(&fx.repo, "main");
+    let stale_remote = sha(&fx.repo, "origin/main");
 
-    // Detach the main checkout so `main` isn't checked out anywhere. The
-    // dependency tree still needs a worktree for the default branch, so the
-    // run ends with that existing error — but only after the ref has moved.
+    // Detach the main checkout so `main` isn't checked out anywhere.
     git(&fx.repo, &["checkout", "-q", "--detach"]);
-    let head_before = sha(&fx.repo, "HEAD");
 
     let (output, stderr) = wt_sync(&fx.repo, &["--pull"]);
 
-    assert_eq!(sha(&fx.repo, "main"), target, "ref should be updated");
-    assert_eq!(
-        sha(&fx.repo, "HEAD"),
-        head_before,
-        "detached HEAD untouched"
-    );
-    assert!(stderr.contains("Fast-forwarded main"), "{stderr}");
+    assert!(!output.status.success(), "expected failure, got:\n{stderr}");
+    assert!(stderr.contains("has no worktree"), "{stderr}");
     assert!(
-        !output.status.success() && stderr.contains("has no worktree"),
-        "expected the no-worktree error after the fast-forward, got:\n{stderr}"
+        !stderr.contains("Fetching"),
+        "must fail before fetching:\n{stderr}"
     );
-    // The reflog records who moved it.
-    let reflog = git(&fx.repo, &["reflog", "show", "main", "-1"]);
-    assert!(reflog.contains("wt sync --pull"), "{reflog}");
+    assert_eq!(sha(&fx.repo, "main"), stale, "main must not move");
+    assert_eq!(sha(&fx.repo, "origin/main"), stale_remote, "no fetch");
 }
 
 #[test]
