@@ -257,9 +257,9 @@ fn test_stale_branch_in_stack_file_does_not_crash() {
         String::from_utf8_lossy(&output.stdout),
     );
 
-    // child should be reparented to main
+    // child should be reparented to main (it already sits on main's tip)
     assert!(
-        stderr.contains("rebase child onto main"),
+        stderr.contains("child is up to date with main"),
         "child should be reparented to main, got stderr: {stderr}"
     );
 }

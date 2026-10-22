@@ -323,5 +323,13 @@ fn pull_dry_run_previews_without_touching_anything() {
     assert!(stderr.contains("may be stale"), "{stderr}");
     assert!(stderr.contains("$ git fetch"), "{stderr}");
     assert!(stderr.contains("merge --ff-only origin/main"), "{stderr}");
+    // The plan must account for the pending fast-forward: feature is up to
+    // date with the stale local main, but not with where main would move.
     assert!(stderr.contains("rebase feature onto main"), "{stderr}");
+    assert!(!stderr.contains("feature is up to date"), "{stderr}");
+    let mb = sha(&fx.repo, "main");
+    assert!(
+        stderr.contains(&format!("$ git rebase --onto main {mb} feature")),
+        "{stderr}"
+    );
 }

@@ -200,6 +200,87 @@ fn save_fork_points(
     Ok(())
 }
 
+/// Pick the `--onto` base for rebasing `branch` onto `parent`, and a short
+/// reason for the choice (shown with `-v`).
+///
+/// A reparented branch always uses its integrated original parent. Otherwise
+/// the stored fork-point (the parent tip at last sync) competes with the
+/// current merge-base:
+///
+/// - stored ⊑ merge-base: the branch was rebased by hand onto a newer parent
+///   commit since the last sync. The stored value is stale; replaying from it
+///   would re-apply commits the parent already has. Use the merge-base.
+/// - merge-base ⊑ stored: the parent was rebased, so the merge-base slid back
+///   to an older ancestor. The stored fork-point is the only thing that knows
+///   where the branch's own commits start. Use it.
+/// - stored not in the branch's history, or unrelated to the merge-base:
+///   warn and fall back to the merge-base.
+fn choose_rebase_base(
+    repo: &Repository,
+    branch: &str,
+    parent: &str,
+    original_parent: Option<&str>,
+    stored_fp: Option<&str>,
+    merge_base: &str,
+) -> (String, String) {
+    if let Some(orig) = original_parent {
+        return (
+            orig.to_string(),
+            format!("using {orig}: reparented from integrated branch"),
+        );
+    }
+    let Some(fp) = stored_fp else {
+        return (
+            merge_base.to_string(),
+            "using merge-base: no stored fork-point".to_string(),
+        );
+    };
+    let is_ancestor = |a: &str, b: &str| {
+        repo.run_command_check(&["merge-base", "--is-ancestor", a, b])
+            .unwrap_or(false)
+    };
+    if !is_ancestor(fp, branch) {
+        eprintln!(
+            "{}",
+            warning_message(cformat!(
+                "Stored fork-point for <bold>{branch}</> is not in its history; using merge-base"
+            ))
+        );
+        return (
+            merge_base.to_string(),
+            "using merge-base: stored fork-point is not in the branch's history".to_string(),
+        );
+    }
+    if fp == merge_base {
+        return (
+            merge_base.to_string(),
+            "using stored fork-point (same as merge-base)".to_string(),
+        );
+    }
+    if is_ancestor(fp, merge_base) {
+        return (
+            merge_base.to_string(),
+            format!("using merge-base: stored fork-point is stale ({branch} was rebased onto a newer {parent})"),
+        );
+    }
+    if is_ancestor(merge_base, fp) {
+        return (
+            fp.to_string(),
+            format!("using stored fork-point: {parent} was rebased since last sync"),
+        );
+    }
+    eprintln!(
+        "{}",
+        warning_message(cformat!(
+            "Stored fork-point for <bold>{branch}</> is unrelated to its merge-base with <bold>{parent}</>; using merge-base"
+        ))
+    );
+    (
+        merge_base.to_string(),
+        "using merge-base: stored fork-point is unrelated to the merge-base".to_string(),
+    )
+}
+
 /// Parse a stack file (git-machete compatible format) into a parent map.
 ///
 /// The full git-machete format is indentation-based, one branch per line,
@@ -978,20 +1059,17 @@ pub fn handle_sync(opts: SyncOptions) -> anyhow::Result<()> {
             continue;
         }
 
-        // Determine the rebase base: use the stored fork-point (old parent tip)
-        // when available, otherwise fall back to the merge-base.
-        // The fork-point is essential when the parent was rebased — the merge-base
-        // shifts to an older ancestor, but the fork-point stays at the old parent tip.
-        let rebase_base = if let Some(ref orig_parent) = node.original_parent {
-            // Reparented branch — base is the integrated parent branch
-            orig_parent.clone()
-        } else if let Some(stored_fp) = fork_points.get(branch) {
-            // Use the stored fork-point from the previous sync
-            stored_fp.clone()
-        } else {
-            // First sync or no fork-point — fall back to merge-base
-            mb.clone()
-        };
+        let (rebase_base, reason) = choose_rebase_base(
+            &repo,
+            branch,
+            parent,
+            node.original_parent.as_deref(),
+            fork_points.get(branch).map(String::as_str),
+            &mb,
+        );
+        if opts.verbose {
+            eprintln!("{}", hint_message(reason));
+        }
 
         eprintln!(
             "{}",
@@ -1248,7 +1326,8 @@ fn print_sync_plan(
     }
 
     let fork_points = load_fork_points(repo);
-    let mut has_ops = false;
+    let mut printed = false;
+    let mut has_rebases = false;
     for &branch in branches {
         let Some(node) = tree.nodes.get(branch) else {
             continue;
@@ -1257,27 +1336,56 @@ fn print_sync_plan(
             continue;
         };
 
+        // Same up-to-date check as the real run, against the parent's current
+        // tip. With a pending `--pull` fast-forward the real run moves the root
+        // first, so plan the root's children against the upstream tip it would
+        // move to rather than the stale local ref.
+        let parent_rev: &str = match pending_ff {
+            Some(ff) if parent == &tree.root => ff.upstream.as_str(),
+            _ => parent.as_str(),
+        };
+        let Ok(Some(mb)) = repo.merge_base(parent_rev, branch) else {
+            continue;
+        };
+        let parent_sha = repo
+            .run_command(&["rev-parse", parent_rev])
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default();
+        if mb == parent_sha {
+            eprintln!("  {branch} is up to date with {parent}");
+            printed = true;
+            continue;
+        }
+
+        let (base, reason) = choose_rebase_base(
+            repo,
+            branch,
+            parent,
+            node.original_parent.as_deref(),
+            fork_points.get(branch).map(String::as_str),
+            &mb,
+        );
         if let Some(ref orig_parent) = node.original_parent {
             eprintln!(
-                "  rebase --onto {parent} {orig_parent} {branch}  (reparented from integrated {orig_parent})"
+                "  rebase {branch} onto {parent}  (reparented from integrated {orig_parent})"
             );
-            if opts.verbose {
-                eprintln!("    $ git rebase --onto {parent} {orig_parent} {branch}");
-            }
         } else {
             eprintln!("  rebase {branch} onto {parent}");
-            if opts.verbose {
-                let base = fork_points
-                    .get(branch)
-                    .map(|s| s.as_str())
-                    .unwrap_or("<merge-base>");
-                eprintln!("    $ git rebase --onto {parent} {base} {branch}");
-            }
         }
-        has_ops = true;
+        if opts.verbose {
+            eprintln!("    $ git rebase --onto {parent} {base} {branch}");
+            eprintln!("    # {reason}");
+        }
+        printed = true;
+        has_rebases = true;
     }
-    if !has_ops {
+    if !printed {
         eprintln!("  (none)");
+    } else if has_rebases {
+        eprintln!();
+        eprintln!(
+            "Note: branches whose parent is rebased earlier in the same run are shown against the parent's current tip; the real run recomputes them after the parent moves."
+        );
     }
 
     if opts.verbose {
