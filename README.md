@@ -6,7 +6,7 @@ Works with any git worktrees — no special setup required. Can also be used as 
 
 ## How it works
 
-`wt sync` detects the branch dependency tree from git's commit graph using pairwise merge-base analysis, then rebases each branch onto its parent in topological order.
+`wt sync` detects the branch dependency tree from git's commit graph by merge-base analysis (one `git rev-list` dump of the worktree tips, cut off at their common ancestor), then rebases each branch onto its parent in topological order.
 
 All rebases use `--onto` with a stored fork-point, so parent branches that have been rewritten (rebased, amended, or force-pushed) are handled correctly — no duplicate commits or spurious conflicts.
 
