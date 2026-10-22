@@ -605,6 +605,11 @@ struct CommitGraph<'d> {
     shas: Vec<&'d str>,
     parents: Vec<Vec<usize>>,
     children: Vec<Vec<usize>>,
+    /// Whether the dump gave the commit its own line. A commit that only ever
+    /// appears as someone's parent is *dangling*: `^floor^@` cut it off, so it
+    /// is an ancestor of the floor and common to every tip. It never counts as
+    /// a commit ahead and never takes part in a bitset.
+    listed: Vec<bool>,
 }
 
 /// Position of `sha`, adding it when new. `None` once the next commit would
@@ -636,6 +641,7 @@ impl<'d> CommitGraph<'d> {
         let mut index = HashMap::new();
         let mut shas = Vec::new();
         let mut parents: Vec<Vec<usize>> = Vec::new();
+        let mut listed: Vec<bool> = Vec::new();
 
         for line in dump.lines() {
             let mut parts = line.split_whitespace();
@@ -643,11 +649,14 @@ impl<'d> CommitGraph<'d> {
                 continue;
             };
             let idx = intern(&mut index, &mut shas, &mut parents, sha, tips, budget)?;
+            listed.resize(shas.len(), false);
+            listed[idx] = true;
             for parent in parts {
                 let parent = intern(&mut index, &mut shas, &mut parents, parent, tips, budget)?;
                 parents[idx].push(parent);
             }
         }
+        listed.resize(shas.len(), false);
 
         let mut children = vec![Vec::new(); parents.len()];
         for (child, listed) in parents.iter().enumerate() {
@@ -661,6 +670,7 @@ impl<'d> CommitGraph<'d> {
             shas,
             parents,
             children,
+            listed,
         })
     }
 
@@ -668,7 +678,7 @@ impl<'d> CommitGraph<'d> {
         let mut bits = Bitset::new(self.shas.len());
         let mut stack = vec![tip];
         while let Some(i) = stack.pop() {
-            if bits.get(i) {
+            if bits.get(i) || !self.listed[i] {
                 continue;
             }
             bits.set(i);
@@ -677,14 +687,14 @@ impl<'d> CommitGraph<'d> {
         bits
     }
 
-    /// Commits reachable from `start` (itself included), and whether `target`
-    /// is one of them.
+    /// Listed commits reachable from `start` (itself included), and whether
+    /// `target` is one of them.
     fn reach_from(&self, start: usize, target: Option<usize>) -> (usize, bool) {
         let mut seen = vec![false; self.shas.len()];
         let mut stack = vec![start];
         let mut count = 0;
         while let Some(i) = stack.pop() {
-            if seen[i] {
+            if seen[i] || !self.listed[i] {
                 continue;
             }
             seen[i] = true;
@@ -928,6 +938,8 @@ mod tests {
         assert_eq!(graph.shas.len(), 4); // c1, p1, p2 (dangling), root
         assert!(graph.index.contains_key("p2"));
         assert!(graph.parents[graph.index["p2"]].is_empty());
+        assert!(!graph.listed[graph.index["p2"]]);
+        assert!(graph.listed[graph.index["c1"]] && graph.listed[graph.index["root"]]);
     }
 
     #[test]
@@ -1170,6 +1182,54 @@ root
             infer_parents(&basefar, &branches, "main", &skip, MemoryBudget::default()).unwrap();
         assert!(basefar.merge_base_calls.get() > 0);
         assert_eq!(far.parents.get("child").map(String::as_str), Some("rival"));
+    }
+
+    /// X forks below the floor and merges main back in, so its fork commit's
+    /// parent sits under the floor in X's history only. That parent is common
+    /// to every tip and must not be counted as one of X's own commits.
+    #[test]
+    fn fork_below_the_floor_is_not_counted_ahead() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo);
+        commit(&repo, "root.txt", "root");
+        commit(&repo, "m1.txt", "m1");
+        let m1 = git(&repo, &["rev-parse", "HEAD"]);
+        commit(&repo, "m2.txt", "m2");
+        let m2 = git(&repo, &["rev-parse", "HEAD"]);
+        commit(&repo, "m3.txt", "m3");
+        git(&repo, &["checkout", "-b", "X", &m1]);
+        commit(&repo, "x1.txt", "x1");
+        git(&repo, &["branch", "xside", &m2]);
+        git(&repo, &["merge", "--no-ff", "--no-edit", "xside"]);
+        git(&repo, &["branch", "-D", "xside"]);
+        git(&repo, &["merge", "--no-ff", "--no-edit", "main"]);
+        git(&repo, &["checkout", "-b", "B", "main"]);
+        for i in 1..=5 {
+            commit(&repo, &format!("b{i}.txt"), &format!("b{i}"));
+        }
+        git(&repo, &["checkout", "main"]);
+        for i in 1..=4 {
+            commit(&repo, &format!("a{i}.txt"), &format!("a{i}"));
+        }
+
+        // X is 3 ahead of main, main is 4 ahead of X's merge: X is B's parent.
+        assert_parent(&repo, &["main", "X", "B"], "B", "X");
+
+        let git_repo = Repository::at(&repo).unwrap();
+        let recording = Recording::new(&git_repo);
+        let skip = HashSet::new();
+        infer_parents(
+            &recording,
+            &["main", "X", "B"],
+            "main",
+            &skip,
+            MemoryBudget::default(),
+        )
+        .unwrap();
+        // Dangling nodes under the floor are not best merge-bases either.
+        assert_eq!(recording.pair_git_calls.get(), 0);
     }
 
     /// Delegates to a real repository and records what the inference asked of git.
