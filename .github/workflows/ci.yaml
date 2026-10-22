@@ -22,7 +22,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      # worktrunk requires rustc >= 1.97 (see rust-version in Cargo.toml)
+      # worktrunk requires rustc >= 1.98 (see rust-version in Cargo.toml)
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
@@ -37,7 +37,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      # worktrunk requires rustc >= 1.97 (see rust-version in Cargo.toml)
+      # worktrunk requires rustc >= 1.98 (see rust-version in Cargo.toml)
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2

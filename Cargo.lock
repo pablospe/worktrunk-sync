@@ -1223,6 +1223,68 @@ dependencies = [
 ]
 
 [[package]]
+name = "gix-error"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bb3308a948a01b94ef13d9ee7a9b28c1303d8d9a9dc33b401ff40c2184d9e04a"
+dependencies = [
+ "bstr",
+]
+
+[[package]]
+name = "gix-path"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a6d563d4d0c975ed0df4e853f9ec962a2ba46633b1d324e1a5582541fcae0c6b"
+dependencies = [
+ "bstr",
+ "gix-error",
+ "gix-trace",
+ "gix-validate",
+]
+
+[[package]]
+name = "gix-trace"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "133f2de116104d637541831b6acb157898556d5eeec363ab2eb1c583adc6bb56"
+
+[[package]]
+name = "gix-url"
+version = "0.40.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "04317dea7a5dd5253bbcab060c230f3de6a57d17cc9600c6cd7030bf4795b414"
+dependencies = [
+ "bstr",
+ "gix-error",
+ "gix-path",
+ "gix-utils",
+ "percent-encoding",
+]
+
+[[package]]
+name = "gix-utils"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f8e770b8c34311044d1addc7b18957db0ac27183707e1140dc90e6f674a6354e"
+dependencies = [
+ "bstr",
+ "fastrand",
+ "getrandom 0.4.2",
+ "unicode-normalization",
+]
+
+[[package]]
+name = "gix-validate"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cbcd59cc52742468bc5c8a0e7123390d154f45e6cbd37461b0dcecdc681f2179"
+dependencies = [
+ "bstr",
+ "gix-error",
+]
+
+[[package]]
 name = "globset"
 version = "0.4.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1635,12 +1697,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a64a92489e2744ce060c349162be1c5f33c6969234104dbd99ddb5feb08b8c15"
 
 [[package]]
-name = "memo-map"
-version = "0.3.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "38d1115007560874e373613744c6fba374c17688327a71c1476d1a5954cc857b"
-
-[[package]]
 name = "memoffset"
 version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1660,11 +1716,10 @@ dependencies = [
 
 [[package]]
 name = "minijinja"
-version = "2.24.0"
+version = "3.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "86886cf6dbf4e614b19c9a1eec9775f021869d7eadde0fc73921a81b90c9b4c9"
+checksum = "0032a2738ba16d9a8822e4eb2833faeed5c41d767633ea753f33b6becd58cbfc"
 dependencies = [
- "memo-map",
  "serde",
 ]
 
@@ -2826,9 +2881,9 @@ checksum = "33f4fe9184a62d842c9ef383018f3306d8ba224fd9d836f56d7288308847c256"
 
 [[package]]
 name = "skim"
-version = "5.7.0"
+version = "5.7.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6530d7097c20d79eb1c1436ae6a8f764f08da43b31a767424a382ad72a6a8d7a"
+checksum = "7eacf411713d7c8a1c3f2d7486fa25c62ba587f46ab5525e8fd8418aee5500de"
 dependencies = [
  "ansi-to-tui",
  "assert_enum_variants",
@@ -4221,9 +4276,9 @@ dependencies = [
 
 [[package]]
 name = "worktrunk"
-version = "0.80.0"
+version = "0.81.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "791bad41010e92d2ecafa5bebc62da66a65f3580c4da47073759b66ab5b531f8"
+checksum = "87772b4e8d172105b50666c8ea255e11782dfe3653f4cbb49cc97252c5dcab74"
 dependencies = [
  "ansi-str",
  "ansi-to-tui",
@@ -4243,6 +4298,7 @@ dependencies = [
  "dunce",
  "etcetera",
  "fs2",
+ "gix-url",
  "home",
  "humantime",
  "ignore",
@@ -4263,6 +4319,7 @@ dependencies = [
  "reflink-copy",
  "regex",
  "renamore",
+ "rustix",
  "sanitize-filename",
  "schemars",
  "serde",
@@ -4273,6 +4330,7 @@ dependencies = [
  "shellexpand",
  "signal-hook 0.4.4",
  "skim",
+ "socket2",
  "strsim",
  "strum",
  "supports-hyperlinks",
