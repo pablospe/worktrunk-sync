@@ -33,6 +33,7 @@ The binary is named `wt-sync` and can be run directly. If [worktrunk](https://gi
 wt-sync              # sync the current stack (default)
 wt-sync --all        # sync all stacks
 wt-sync -nv          # preview the plan with git commands
+wt-sync --pull       # fetch, fast-forward main, then sync
 wt-sync --push-only  # push the current stack without rebasing
 
 # Or via worktrunk:
@@ -43,10 +44,20 @@ wt sync --all
 ### Full workflow
 
 ```bash
-wt sync --fetch --push --prune
+wt sync --pull --push --prune   # or: wt sync -upP
 ```
 
-This fetches from the remote, rebases branches in the current stack, pushes the rebased branches, and removes any worktrees whose branches have been merged.
+This fetches from the remote, fast-forwards `main` to `origin/main`, rebases branches in the current stack onto it, pushes the rebased branches, and removes any worktrees whose branches have been merged.
+
+### Fetch vs pull
+
+`--fetch` only updates the remote-tracking refs (`origin/main`); branches are still rebased onto your local `main`. That is enough to detect branches merged on the remote, but if your local `main` is behind, the stack ends up rebased onto a stale base. `wt sync` now warns about that:
+
+```
+⚠ main is 3 commits behind origin/main; run with --pull to update it
+```
+
+`--pull` (`-u`) mirrors `git pull --ff-only` for the root: it fetches, then fast-forwards `main` to its upstream before the stack is rebased, so the rebase lands on what the remote actually has. Stacked branches are never touched by this step. The root is only moved when that's safe: if it is checked out, its worktree must be clean with no rebase or merge in progress; if it isn't checked out anywhere, only the ref moves. A root that has diverged from its upstream, has no upstream, or sits in a dirty worktree is left alone with a warning, and the sync continues as it would have without `--pull`. In `--dry-run` mode no fetch happens, so the preview is based on the remote-tracking refs you already have.
 
 ### Push only
 
@@ -64,6 +75,7 @@ Pushes each branch in the selected scope as-is (`git push --force-with-lease`), 
 | `--stack` | `-s` | Sync only the current stack (default) |
 | `--all` | `-a` | Sync all stacks |
 | `--fetch` | `-f` | Fetch from remote before syncing |
+| `--pull` | `-u` | Fetch, then fast-forward the root branch to its upstream (implies `--fetch`) |
 | `--push` | `-p` | Push rebased branches after syncing |
 | `--push-only` | | Push the stack as-is, without fetching or rebasing |
 | `--prune` | `-P` | Remove integrated worktrees after syncing |

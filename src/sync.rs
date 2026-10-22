@@ -21,10 +21,11 @@
 //! - `--all` syncs every worktree branch
 //! - `--dry-run` previews the plan without executing
 //! - `--push-only` pushes the stack as-is, without fetching or rebasing
+//! - `--pull` fetches and fast-forwards the root branch to its upstream first
 //! - Stops on first conflict; user resolves and re-runs
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context};
 use color_print::cformat;
@@ -148,6 +149,8 @@ impl DependencyTree {
 /// Options for the sync command.
 pub struct SyncOptions {
     pub fetch: bool,
+    /// Fast-forward root branches to their upstream before building the tree.
+    pub pull: bool,
     pub all: bool,
     pub push: bool,
     /// Push the selected branches as-is, skipping fetch and rebase.
@@ -642,9 +645,182 @@ fn build_dependency_tree(
     ))
 }
 
+/// A fast-forward of the root branch that `--pull` would perform (dry-run).
+struct PendingFastForward {
+    upstream: String,
+    /// Worktree where the root is checked out.
+    worktree: PathBuf,
+}
+
+/// Worktree that has `branch` checked out, if any.
+fn worktree_for_branch(repo: &Repository, branch: &str) -> anyhow::Result<Option<PathBuf>> {
+    Ok(repo
+        .list_worktrees()?
+        .iter()
+        .find(|wt| !wt.bare && !wt.detached && wt.branch.as_deref() == Some(branch))
+        .map(|wt| wt.path.clone()))
+}
+
+/// Compare the root branch with its upstream and, with `--pull`, fast-forward it.
+///
+/// Runs after the fetch and before the dependency tree is built, so the
+/// integration checks, `--prune` and every rebase see the updated root.
+/// Stacked branches are never touched here.
+///
+/// Never fails the run: a root that can't be fast-forwarded (diverged, dirty
+/// worktree, no upstream) gets a warning and the sync continues on the local
+/// ref as it always has. Without `--pull`, a root that is behind its upstream
+/// still gets a warning, so a rebase onto a stale `main` is no longer silent.
+///
+/// Returns the fast-forward that a dry run would perform, for the plan.
+fn update_root(
+    repo: &Repository,
+    root: &str,
+    worktree: &Path,
+    opts: &SyncOptions,
+) -> anyhow::Result<Option<PendingFastForward>> {
+    let Some(upstream) = repo.branch(root).upstream()? else {
+        if opts.pull {
+            eprintln!(
+                "{}",
+                warning_message(cformat!("<bold>{root}</> has no upstream; nothing to pull"))
+            );
+        }
+        return Ok(None);
+    };
+
+    let local_sha = repo.run_command(&["rev-parse", "--verify", &format!("refs/heads/{root}")])?;
+    let local_sha = local_sha.trim();
+    let upstream_sha =
+        repo.run_command(&["rev-parse", "--verify", &format!("{upstream}^{{commit}}")])?;
+    let upstream_sha = upstream_sha.trim();
+
+    if local_sha == upstream_sha {
+        if opts.pull {
+            eprintln!(
+                "{}",
+                success_message(cformat!(
+                    "<bold>{root}</> is up to date with <bold>{upstream}</>"
+                ))
+            );
+        }
+        return Ok(None);
+    }
+
+    // Only a root whose tip is an ancestor of its upstream can be
+    // fast-forwarded. Ahead-only roots have nothing to pull.
+    if !repo.is_ancestor_by_sha(local_sha, upstream_sha)? {
+        if !repo.is_ancestor_by_sha(upstream_sha, local_sha)? {
+            let ahead = repo.count_commits(upstream_sha, local_sha)?;
+            let behind = repo.count_commits(local_sha, upstream_sha)?;
+            eprintln!(
+                "{}",
+                warning_message(cformat!(
+                    "<bold>{root}</> has diverged from <bold>{upstream}</> ({ahead} ahead, {behind} behind); not fast-forwarding. Merge or rebase it manually."
+                ))
+            );
+        }
+        return Ok(None);
+    }
+
+    let behind = repo.count_commits(local_sha, upstream_sha)?;
+    let commits = if behind == 1 { "commit" } else { "commits" };
+
+    if !opts.pull {
+        eprintln!(
+            "{}",
+            warning_message(cformat!(
+                "<bold>{root}</> is {behind} {commits} behind <bold>{upstream}</>; run with --pull to update it"
+            ))
+        );
+        return Ok(None);
+    }
+
+    let short_old = repo.run_command(&["rev-parse", "--short", local_sha])?;
+    let short_new = repo.run_command(&["rev-parse", "--short", upstream_sha])?;
+    let range = format!("{}..{}", short_old.trim(), short_new.trim());
+
+    if opts.dry_run {
+        eprintln!(
+            "{}",
+            progress_message(cformat!(
+                "Would fast-forward <bold>{root}</> {range} ({behind} {commits})"
+            ))
+        );
+        eprintln!(
+            "{}",
+            hint_message(
+                "Dry run skips the fetch, so this is based on the current remote-tracking refs and may be stale."
+            )
+        );
+        return Ok(Some(PendingFastForward {
+            upstream,
+            worktree: worktree.to_path_buf(),
+        }));
+    }
+
+    match fast_forward_root(repo, &upstream, worktree) {
+        Ok(()) => eprintln!(
+            "{}",
+            success_message(cformat!(
+                "Fast-forwarded <bold>{root}</> {range} ({behind} {commits})"
+            ))
+        ),
+        Err(e) => {
+            eprintln!(
+                "{}",
+                warning_message(cformat!(
+                    "Could not fast-forward <bold>{root}</> to <bold>{upstream}</>: {e}"
+                ))
+            );
+            eprintln!(
+                "{}",
+                hint_message(cformat!(
+                    "Continuing with the local <bold>{root}</>, which is {behind} {commits} behind."
+                ))
+            );
+        }
+    }
+    Ok(None)
+}
+
+/// Fast-forward the root checked out in `worktree` to `upstream`.
+///
+/// Goes through `git merge --ff-only` in that worktree so the index and
+/// working tree follow the branch. That is only safe in a clean worktree with
+/// no operation in progress; otherwise the root is left alone. The caller has
+/// already proven this is a fast-forward.
+fn fast_forward_root(repo: &Repository, upstream: &str, worktree: &Path) -> anyhow::Result<()> {
+    let wt = repo.worktree_at(worktree);
+    if let Some(op) = wt.operation_in_progress()? {
+        let op: &'static str = op.into();
+        bail!("its worktree has a {op} in progress");
+    }
+    let status = wt.run_command(&["status", "--porcelain", "-uno"])?;
+    if !status.trim().is_empty() {
+        bail!(
+            "its worktree {} has uncommitted changes",
+            worktree.display()
+        );
+    }
+    wt.run_command(&["merge", "--ff-only", upstream])
+        .context("git merge --ff-only failed")?;
+    Ok(())
+}
+
 /// Execute the sync operation.
 pub fn handle_sync(opts: SyncOptions) -> anyhow::Result<()> {
     let repo = Repository::current()?;
+
+    // The root must be checked out somewhere: the dependency tree needs its
+    // worktree, and `--pull` fast-forwards through it. Check up front so a
+    // run that is going to fail does so before fetching or moving any ref.
+    let default_branch = repo
+        .default_branch()
+        .context("Cannot determine default branch")?;
+    let Some(root_worktree) = worktree_for_branch(&repo, &default_branch)? else {
+        bail!("Default branch '{default_branch}' has no worktree. Cannot build dependency tree.");
+    };
 
     // Fetch from remote if requested (skip in dry-run)
     if opts.fetch && !opts.dry_run {
@@ -652,6 +828,10 @@ pub fn handle_sync(opts: SyncOptions) -> anyhow::Result<()> {
         repo.run_command(&["fetch"]).context("git fetch failed")?;
         eprintln!("{}", success_message("Fetch complete"));
     }
+
+    // Fast-forward (or at least check) the root branch before planning, so
+    // the tree is built against the root the remote actually has.
+    let pending_ff = update_root(&repo, &default_branch, &root_worktree, &opts)?;
 
     // Build dependency tree
     let (tree, integrated) = build_dependency_tree(&repo)?;
@@ -691,7 +871,14 @@ pub fn handle_sync(opts: SyncOptions) -> anyhow::Result<()> {
 
     // Dry-run mode: show plan and exit
     if opts.dry_run {
-        print_sync_plan(&repo, &tree, &branches_to_sync, &integrated, &opts);
+        print_sync_plan(
+            &repo,
+            &tree,
+            &branches_to_sync,
+            &integrated,
+            pending_ff.as_ref(),
+            &opts,
+        );
         return Ok(());
     }
 
@@ -1025,11 +1212,18 @@ fn print_sync_plan(
     tree: &DependencyTree,
     branches: &[&str],
     integrated: &[IntegratedBranch],
+    pending_ff: Option<&PendingFastForward>,
     opts: &SyncOptions,
 ) {
     if opts.verbose && opts.fetch {
         eprintln!("Fetch:");
         eprintln!("    $ git fetch");
+        if let Some(PendingFastForward { upstream, worktree }) = pending_ff {
+            eprintln!(
+                "    $ git -C {} merge --ff-only {upstream}",
+                worktree.to_string_lossy()
+            );
+        }
         eprintln!();
     }
 
