@@ -6,6 +6,7 @@ on:
 
 permissions:
   contents: write
+  id-token: write # crates.io Trusted Publishing (OIDC)
 
 env:
   CARGO_TERM_COLOR: always
@@ -28,10 +29,15 @@ jobs:
       - name: Test
         run: cargo test --release
 
+      # Short-lived token via crates.io Trusted Publishing; revoked when the job ends.
+      - name: Authenticate with crates.io
+        id: auth
+        uses: rust-lang/crates-io-auth-action@v1
+
       - name: Publish to crates.io
         run: cargo publish
         env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
 
       - name: Create GitHub release
         env:
