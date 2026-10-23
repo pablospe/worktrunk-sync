@@ -1,7 +1,8 @@
 //! `wt sync` — rebase stacked worktree branches in dependency order.
 //!
-//! Detects the branch dependency tree from git's commit graph using pairwise
-//! merge-base analysis, then rebases each branch onto its parent in topological
+//! Detects the branch dependency tree from git's commit graph using one
+//! `rev-list --parents` dump (pairwise git only over the memory budget, or
+//! for criss-cross pairs), then rebases each branch onto its parent in topological
 //! order. All rebases use `--onto` with a stored fork-point, which correctly
 //! handles parent branches that have been rewritten (rebased, amended, or
 //! force-pushed). Integrated (merged) branches are detected and their children
@@ -497,113 +498,32 @@ fn build_dependency_tree(
             parent_map.insert(branch.clone(), (parent, None));
         }
     } else {
-        // Infer parents from the commit graph using merge-base analysis.
-        //
-        // For each branch B, the parent P is selected in two tiers:
-        //   1. True ancestors (candidate_depth == 0, meaning merge_base ==
-        //      candidate tip): branches whose tip is reachable from B. Among
-        //      true ancestors, pick the closest (smallest branch_depth).
-        //   2. Diverged candidates (only if no true ancestors): pick by
-        //      smallest branch_depth, then smallest candidate_depth.
-        //
-        // This prevents cycles in stacked branches: if B descends from C
-        // (C's tip is on B's history), C is a true ancestor and always wins
-        // over siblings that merely share a common fork point.
-        //
         // Limitation: after syncing + adding a mid-stack commit, the parent
         // branch becomes "diverged" and may lose to the default branch (a
         // true ancestor). The auto-saved stack file (`.git/wt/stack`) avoids
         // this by preserving explicit parent relationships across syncs.
         let branch_names: Vec<&str> = branches.iter().map(|(b, _)| b.as_str()).collect();
-
-        for (branch, _) in &branches {
-            if branch == &default_branch || integrated.contains_key(branch) {
-                continue;
-            }
-
-            let mut ancestors: Vec<(&str, String, usize)> = Vec::new();
-            let mut diverged: Vec<(&str, String, usize, usize)> = Vec::new();
-
-            for candidate in &branch_names {
-                if *candidate == branch.as_str() {
-                    continue;
-                }
-
-                let Some(mb) = repo.merge_base(candidate, branch)? else {
-                    continue;
-                };
-
-                let branch_depth = repo.count_commits(&mb, branch)?;
-
-                if branch_depth == 0 {
-                    continue;
-                }
-
-                let candidate_depth = repo.count_commits(&mb, candidate)?;
-
-                if candidate_depth == 0 {
-                    ancestors.push((candidate, mb, branch_depth));
-                } else {
-                    diverged.push((candidate, mb, branch_depth, candidate_depth));
-                }
-            }
-
-            let mut best_parent: Option<&str> = None;
-            let mut tie_candidates: Vec<(&str, String)> = Vec::new();
-
-            if !ancestors.is_empty() {
-                ancestors.sort_by_key(|&(_, _, bd)| bd);
-                let best_bd = ancestors[0].2;
-                tie_candidates = ancestors
-                    .iter()
-                    .filter(|&&(_, _, bd)| bd == best_bd)
-                    .map(|&(c, ref mb, _)| (c, mb.clone()))
-                    .collect();
-                best_parent = Some(ancestors[0].0);
-            } else if !diverged.is_empty() {
-                diverged.sort_by_key(|&(_, _, bd, cd)| (bd, cd));
-                let (best_bd, best_cd) = (diverged[0].2, diverged[0].3);
-                tie_candidates = diverged
-                    .iter()
-                    .filter(|&&(_, _, bd, cd)| bd == best_bd && cd == best_cd)
-                    .map(|&(c, ref mb, _, _)| (c, mb.clone()))
-                    .collect();
-                best_parent = Some(diverged[0].0);
-            }
-
-            if tie_candidates.len() > 1 {
-                let mb_shas: Vec<&str> = tie_candidates.iter().map(|(_, mb)| mb.as_str()).collect();
-                let commits = repo.commit_details_many(&mb_shas)?;
-
-                let mut best_ts = i64::MIN;
-                let mut resolved_parent: Option<&str> = None;
-                for (candidate, mb) in &tie_candidates {
-                    if let Some(&(_, ts, _)) = commits.get(mb.as_str()) {
-                        if ts > best_ts {
-                            best_ts = ts;
-                            resolved_parent = Some(candidate);
-                        }
-                    }
-                }
-                if let Some(p) = resolved_parent {
-                    best_parent = Some(p);
-                }
-
-                let names: Vec<&str> = tie_candidates.iter().map(|(c, _)| *c).collect();
-                eprintln!(
-                    "{}",
-                    warning_message(cformat!(
-                        "Branch <bold>{}</> has equidistant parents: {}. Picked <bold>{}</>.",
-                        branch,
-                        names.join(", "),
-                        best_parent.unwrap_or("unknown"),
-                    ))
-                );
-            }
-
-            if let Some(parent) = best_parent {
-                parent_map.insert(branch.clone(), (parent.to_string(), None));
-            }
+        let skip: std::collections::HashSet<&str> = integrated.keys().map(String::as_str).collect();
+        let inferred = crate::parent_infer::infer_parents(
+            repo,
+            &branch_names,
+            &default_branch,
+            &skip,
+            crate::parent_infer::MemoryBudget::default(),
+        )?;
+        for warning in inferred.equidistant {
+            eprintln!(
+                "{}",
+                warning_message(cformat!(
+                    "Branch <bold>{}</> has equidistant parents: {}. Picked <bold>{}</>.",
+                    warning.branch,
+                    warning.candidates.join(", "),
+                    warning.picked,
+                ))
+            );
+        }
+        for (branch, parent) in inferred.parents {
+            parent_map.insert(branch, (parent, None));
         }
     }
 
