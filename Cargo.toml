@@ -16,6 +16,8 @@ anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 clap_complete = { version = "4", features = ["unstable-dynamic"] }
 color-print = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 worktrunk = "0.81.0"
 
 [dev-dependencies]
