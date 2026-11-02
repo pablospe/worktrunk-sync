@@ -391,8 +391,8 @@ fn write_stack_file(repo: &Repository, tree: &DependencyTree) -> anyhow::Result<
 /// nearest to B's tip (fewest commits ahead). Integrated branches are excluded
 /// and their children reparented.
 ///
-/// If a stack file (`.git/wt/stack`) exists, it is used for parent detection
-/// instead of merge-base inference.
+/// Branches listed in the stack file (`.git/wt/stack`) keep their recorded
+/// parent; the rest are placed by merge-base inference.
 fn build_dependency_tree(
     repo: &Repository,
 ) -> anyhow::Result<(DependencyTree, Vec<IntegratedBranch>)> {
@@ -481,29 +481,46 @@ fn build_dependency_tree(
         }
     }
 
-    // Determine parent for each branch. If a stack file exists, use it;
-    // otherwise infer parents from the commit graph.
+    // Determine parent for each branch. Branches listed in the stack file keep
+    // their recorded parent; branches missing from it (no stack file yet, or
+    // created after the last sync) get one inferred from the commit graph.
     let mut parent_map: HashMap<String, (String, Option<String>)> = HashMap::new();
 
-    if has_stack_file {
-        for (branch, _) in &branches {
-            if branch == &default_branch || integrated.contains_key(branch) {
-                continue;
-            }
-            let parent = explicit_parents
-                .get(branch)
+    for (branch, _) in &branches {
+        if branch == &default_branch || integrated.contains_key(branch) {
+            continue;
+        }
+        if let Some(parent) = explicit_parents.get(branch) {
+            let parent = Some(parent)
                 .filter(|p| local_branches.contains(p.as_str()))
                 .cloned()
                 .unwrap_or_else(|| default_branch.clone());
             parent_map.insert(branch.clone(), (parent, None));
         }
-    } else {
+    }
+
+    let needs_inference = branches.iter().any(|(b, _)| {
+        b != &default_branch && !integrated.contains_key(b) && !explicit_parents.contains_key(b)
+    });
+    if needs_inference {
         // Limitation: after syncing + adding a mid-stack commit, the parent
         // branch becomes "diverged" and may lose to the default branch (a
         // true ancestor). The auto-saved stack file (`.git/wt/stack`) avoids
         // this by preserving explicit parent relationships across syncs.
+        //
+        // Listed branches are skipped (their parent is already known) but stay
+        // candidates, so a new branch stacked on one of them still finds it.
         let branch_names: Vec<&str> = branches.iter().map(|(b, _)| b.as_str()).collect();
-        let skip: std::collections::HashSet<&str> = integrated.keys().map(String::as_str).collect();
+        let skip: std::collections::HashSet<&str> = integrated
+            .keys()
+            .map(String::as_str)
+            .chain(
+                branch_names
+                    .iter()
+                    .copied()
+                    .filter(|b| explicit_parents.contains_key(*b)),
+            )
+            .collect();
         let inferred = crate::parent_infer::infer_parents(
             repo,
             &branch_names,
