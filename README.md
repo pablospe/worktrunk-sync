@@ -86,6 +86,14 @@ wt sync --push-only --all  # every stack
 
 Pushes each branch in the selected scope as-is (`git push --force-with-lease`), in dependency order, without fetching or rebasing. Branches without an upstream are skipped, just like with `--push`. Worktrees don't need to be clean, and the stack/fork-point files are left untouched. Exits non-zero if any push fails. Run from the default branch's worktree, the "current stack" is every stack, so all branches are pushed. Combine with `-nv` to preview the push commands. Cannot be combined with `--push`, `--fetch` or `--prune`.
 
+### gh-stack
+
+[gh-stack](https://github.com/github/gh-stack) (`gh stack`) manages stacked PRs on GitHub: it opens one PR per branch, links them as a stack, and merges them together. `wt sync` keeps worktrees rebased without any bookkeeping. They work well together: use `wt sync` to keep the worktrees up to date, and `gh stack submit` / `gh stack merge` for the PR side.
+
+If you registered branches with `gh stack init` or `gh stack add`, `wt sync` uses the order you declared for those branches instead of inferring it, and marks them with `(gh-stack)` in the dry-run tree. Other branches are still inferred. Branches whose PR is merged are skipped, so their children move down to the next branch in the stack.
+
+`wt sync` only reads gh-stack's catalog (`.git/gh-stack`). It never writes it and never runs `gh stack sync`, `push` or `submit`. It also refuses to run while a `gh stack rebase` or `modify` is paused, since those branches are mid-rewrite. If gh-stack isn't installed, nothing changes. Pass `--no-gh-stack` to ignore gh-stack and infer every parent.
+
 ### Flags
 
 | Flag | Short | Description |
@@ -100,6 +108,7 @@ Pushes each branch in the selected scope as-is (`git push --force-with-lease`), 
 | `--force` | `-F` | Force removal of dirty integrated worktrees (with `--prune`) |
 | `--verbose` | `-v` | Show git commands that would be executed |
 | `--dry-run` | `-n` | Preview the sync plan without executing |
+| `--no-gh-stack` | | Ignore stacks declared in [gh-stack](#gh-stack) |
 
 ## Example
 
