@@ -144,8 +144,9 @@ Planned operations:
 - **Zero configuration** — dependencies are inferred from git history
 - **Fork-point tracking** — stores the parent SHA at each sync so `--onto` rebases work correctly even after the parent is rewritten
 - **Integrated branch detection** — branches merged into their parent (or into the default branch) are detected; their children are reparented automatically
-- **Conflict handling** — stops on first conflict with instructions to resolve; fork-points for already-rebased branches are saved so re-running `wt sync` picks up where it left off
-- **Non-zero exit on conflict** — so `wt sync && wt sync --push` won't silently push past a conflict
+- **Conflict handling** — before rebasing a branch, `git merge-tree` checks whether it would conflict. If so, the branch and everything stacked on it are skipped with a warning (and not pushed), their worktrees are left untouched, and the rest of the sync goes on. A conflict the check didn't predict stops the sync with instructions to resolve; fork-points for already-rebased branches are saved so re-running `wt sync` picks up where it left off
+- **Non-zero exit on conflict** — when a branch was skipped or a rebase stopped, so `wt sync && wt sync --push` won't silently push past a conflict
+- **From the default branch, every stack** — run from `main`'s worktree, the current stack is all of them, and `wt sync` says so; run from a stack's worktree to sync only that stack
 
 ## Requirements
 
