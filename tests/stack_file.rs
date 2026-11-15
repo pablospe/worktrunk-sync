@@ -103,3 +103,30 @@ fn branch_created_after_first_sync_is_inferred() {
     let stack = std::fs::read_to_string(repo.join(".git/wt/stack")).unwrap();
     assert_eq!(stack, "a\n\tb\n");
 }
+
+#[test]
+fn siblings_off_an_old_main_are_not_dropped() {
+    // x (1 commit) and y (2 commits) both start at an old main, which then
+    // gets 3 more commits. Each is closer to the other than to main, so
+    // inference used to make them each other's parent and both fell out of
+    // the tree: no rebase, no push, no prune.
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "-b", "main"]);
+    commit_file(&repo, "initial.txt");
+    add_branch(&repo, tmp.path(), "x", "main");
+    let y = add_branch(&repo, tmp.path(), "y", "main");
+    commit_file(&y, "y2.txt");
+    for name in ["m1.txt", "m2.txt", "m3.txt"] {
+        commit_file(&repo, name);
+    }
+
+    let plan = wt_sync(&repo, &["--all", "-n"]);
+    assert!(
+        plan.contains("x and y each look like the other's parent"),
+        "{plan}"
+    );
+    assert!(plan.contains("rebase x onto main"), "{plan}");
+    assert!(plan.contains("rebase y onto main"), "{plan}");
+}

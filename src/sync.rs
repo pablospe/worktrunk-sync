@@ -711,6 +711,10 @@ fn build_dependency_tree(
         );
     }
 
+    for why in attach_unreachable(&mut nodes, &default_branch) {
+        eprintln!("{}", warning_message(why));
+    }
+
     // Wire up children
     let branches_with_parents: Vec<(String, String)> = nodes
         .iter()
@@ -755,6 +759,57 @@ fn build_dependency_tree(
 }
 
 /// A fast-forward of the root branch that `--pull` would perform (dry-run).
+/// Put every branch whose parent chain never reaches `root` directly on
+/// `root`, and say why. Such a branch would otherwise drop out of the tree
+/// and be silently skipped by rebase, push and prune.
+///
+/// Two ways to get there: a loop (two branches that diverged from an old
+/// `main` at the same point can each look like the other's closest parent),
+/// or a parent that isn't in the tree. Every branch in a loop goes on `root`:
+/// none of them contains the others, so none is a better parent.
+fn attach_unreachable(nodes: &mut HashMap<String, TreeNode>, root: &str) -> Vec<String> {
+    let mut warnings = Vec::new();
+    let mut names: Vec<String> = nodes.keys().filter(|b| *b != root).cloned().collect();
+    names.sort();
+    for start in names {
+        let mut path: Vec<String> = Vec::new();
+        let mut current = start;
+        while let Some(parent) = nodes.get(&current).and_then(|n| n.parent.clone()) {
+            if parent == root {
+                break;
+            }
+            if let Some(pos) = path.iter().position(|b| *b == parent) {
+                let mut members: Vec<String> = path[pos..].to_vec();
+                members.push(current.clone());
+                members.sort();
+                members.dedup();
+                for member in &members {
+                    if let Some(node) = nodes.get_mut(member) {
+                        node.parent = Some(root.to_string());
+                    }
+                }
+                warnings.push(format!(
+                    "{} each look like the other's parent, which can't both be true; putting them on {root}",
+                    members.join(" and ")
+                ));
+                break;
+            }
+            if !nodes.contains_key(&parent) {
+                if let Some(node) = nodes.get_mut(&current) {
+                    node.parent = Some(root.to_string());
+                }
+                warnings.push(format!(
+                    "{current}'s parent {parent} is not in the tree; putting {current} on {root}"
+                ));
+                break;
+            }
+            path.push(current);
+            current = parent;
+        }
+    }
+    warnings
+}
+
 struct PendingFastForward {
     upstream: String,
     /// Worktree where the root is checked out.
@@ -2060,5 +2115,28 @@ mod tests {
             gh_stack_chains(&tree, &tree.stack_containing("b"), &HashSet::new());
         assert_eq!(chains, vec![vec!["a", "b"]]);
         assert!(skipped.is_empty());
+    }
+
+    #[test]
+    fn test_attach_unreachable_breaks_loops_and_orphans() {
+        // x <-> y loop, z on y, orphan o whose parent is gone.
+        let mut tree = make_tree(&[
+            ("main", None, &[]),
+            ("a", Some("main"), &[]),
+            ("x", Some("y"), &[]),
+            ("y", Some("x"), &[]),
+            ("z", Some("y"), &[]),
+            ("o", Some("gone"), &[]),
+        ]);
+        let warnings = attach_unreachable(&mut tree.nodes, "main");
+        let parent = |b: &str| tree.nodes[b].parent.clone().unwrap();
+        assert_eq!(parent("x"), "main");
+        assert_eq!(parent("y"), "main");
+        assert_eq!(parent("z"), "y");
+        assert_eq!(parent("o"), "main");
+        assert_eq!(parent("a"), "main");
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(warnings.iter().any(|w| w.starts_with("x and y each look")));
+        assert!(warnings.iter().any(|w| w.contains("o's parent gone")));
     }
 }
