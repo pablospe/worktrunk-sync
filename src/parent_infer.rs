@@ -62,6 +62,16 @@ pub trait History {
     fn merge_base(&self, a: &str, b: &str) -> Result<Option<String>>;
     fn count_commits(&self, base: &str, head: &str) -> Result<usize>;
     fn commit_details_many(&self, shas: &[&str]) -> Result<HashMap<String, (String, i64, String)>>;
+    /// Commits `branch` pointed at after it was created, newest first, from
+    /// its reflog. The creation entry is left out: a branch created from some
+    /// commit was never built there. Empty when the reflog is gone.
+    fn past_tips(&self, _branch: &str) -> Result<Vec<String>> {
+        Ok(Vec::new())
+    }
+    /// Commits reachable from `head` but not from `base`.
+    fn commits_between(&self, _base: &str, _head: &str) -> Result<HashSet<String>> {
+        Ok(HashSet::new())
+    }
 }
 
 impl History for Repository {
@@ -148,6 +158,35 @@ impl History for Repository {
 
     fn commit_details_many(&self, shas: &[&str]) -> Result<HashMap<String, (String, i64, String)>> {
         Repository::commit_details_many(self, shas)
+    }
+
+    fn past_tips(&self, branch: &str) -> Result<Vec<String>> {
+        let reference = format!("refs/heads/{branch}");
+        // No reflog (core.logAllRefUpdates off, or expired) is not an error:
+        // there is just nothing to learn from it.
+        let Ok(stdout) = self.run_command(&[
+            "reflog",
+            "show",
+            "--format=%H %gs",
+            "--end-of-options",
+            &reference,
+        ]) else {
+            return Ok(Vec::new());
+        };
+        Ok(stdout
+            .lines()
+            .filter_map(|line| line.split_once(' '))
+            .filter(|(_, subject)| !subject.starts_with("branch: Created from"))
+            .map(|(sha, _)| sha.to_owned())
+            .collect())
+    }
+
+    fn commits_between(&self, base: &str, head: &str) -> Result<HashSet<String>> {
+        let range = format!("{base}..{head}");
+        let stdout = self
+            .run_command(&["rev-list", "--end-of-options", &range])
+            .context("git rev-list failed")?;
+        Ok(stdout.lines().map(str::to_owned).collect())
     }
 }
 
@@ -337,7 +376,7 @@ where
             });
         }
 
-        if let Some(pick) = select_parent(&ranked, history)? {
+        if let Some(pick) = select_parent(branch, &ranked, history)? {
             record_pick(branch, pick, &mut parents, &mut equidistant);
         }
     }
@@ -499,9 +538,21 @@ struct ParentPick {
 /// (same `branch_depth`, same merge-base commit) cannot steal the child on list
 /// order; only `candidate_depth == 0` keeps the parent. Equal ranks keep the
 /// candidate whose merge-base committer timestamp is newest.
-fn select_parent<H: History>(ranked: &[RankedParent], history: &H) -> Result<Option<ParentPick>> {
-    let mut ancestors: Vec<&RankedParent> =
-        ranked.iter().filter(|r| r.candidate_depth == 0).collect();
+///
+/// A diverged candidate still joins tier 1 when its reflog shows it was built
+/// on by the branch (see [`moved_on_parents`]): the branch was started from
+/// it, and it got more commits afterwards.
+fn select_parent<H: History>(
+    branch: &str,
+    ranked: &[RankedParent],
+    history: &H,
+) -> Result<Option<ParentPick>> {
+    let promoted = moved_on_parents(branch, ranked, history)?;
+    let mut ancestors: Vec<&RankedParent> = ranked
+        .iter()
+        .filter(|r| r.candidate_depth == 0)
+        .chain(&promoted)
+        .collect();
     let mut diverged: Vec<&RankedParent> =
         ranked.iter().filter(|r| r.candidate_depth != 0).collect();
 
@@ -547,6 +598,54 @@ fn select_parent<H: History>(ranked: &[RankedParent], history: &H) -> Result<Opt
         parent,
         equidistant: ties.iter().map(|t| t.name.clone()).collect(),
     }))
+}
+
+/// Diverged candidates that used to be an ancestor of `branch`, re-ranked
+/// from the commit where `branch` left them.
+///
+/// History alone can't tell "`branch` was started on C, and C got another
+/// commit since" from "C is a sibling that forked off `branch`": either way C
+/// diverged and the ancestor (say `main`) wins tier 1. C's reflog can: in the
+/// first case C once pointed at a commit `branch` still contains. Only a
+/// commit closer to `branch` than its nearest true ancestor counts, so a
+/// sibling whose reflog reaches back to that ancestor changes nothing.
+fn moved_on_parents<H: History>(
+    branch: &str,
+    ranked: &[RankedParent],
+    history: &H,
+) -> Result<Vec<RankedParent>> {
+    let Some(nearest) = ranked
+        .iter()
+        .filter(|r| r.candidate_depth == 0)
+        .min_by_key(|r| r.branch_depth)
+    else {
+        return Ok(Vec::new());
+    };
+    let closer: Vec<&RankedParent> = ranked
+        .iter()
+        .filter(|r| r.candidate_depth != 0 && r.branch_depth < nearest.branch_depth)
+        .collect();
+    if closer.is_empty() {
+        return Ok(Vec::new());
+    }
+    let head = format!("refs/heads/{branch}");
+    // What `branch` has beyond its nearest ancestor; a commit in here is
+    // newer than that ancestor's tip.
+    let own = history.commits_between(&nearest.merge_base, &head)?;
+    let mut promoted = Vec::new();
+    for candidate in closer {
+        let past = history.past_tips(&candidate.name)?;
+        let Some(left_at) = past.into_iter().find(|sha| own.contains(sha)) else {
+            continue;
+        };
+        promoted.push(RankedParent {
+            name: candidate.name.clone(),
+            branch_depth: history.count_commits(&left_at, &head)?,
+            merge_base: left_at,
+            candidate_depth: 0,
+        });
+    }
+    Ok(promoted)
 }
 
 fn record_pick(
@@ -1120,6 +1219,66 @@ root
     }
 
     #[test]
+    fn parent_that_moved_on_keeps_its_child() {
+        // child was started on parent at p2; parent then got p3. By history
+        // alone parent is a diverged sibling and main would win.
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo);
+        commit(&repo, "root.txt", "root");
+        git(&repo, &["checkout", "-b", "parent"]);
+        commit(&repo, "p1.txt", "p1");
+        commit(&repo, "p2.txt", "p2");
+        git(&repo, &["checkout", "-b", "child"]);
+        commit(&repo, "c1.txt", "c1");
+        git(&repo, &["checkout", "parent"]);
+        commit(&repo, "p3.txt", "p3");
+
+        assert_parent(&repo, &["main", "parent", "child"], "child", "parent");
+        assert_parent(&repo, &["main", "parent", "child"], "parent", "main");
+    }
+
+    #[test]
+    fn amended_parent_keeps_its_child() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo);
+        commit(&repo, "root.txt", "root");
+        git(&repo, &["checkout", "-b", "parent"]);
+        commit(&repo, "p1.txt", "p1");
+        commit(&repo, "p2.txt", "p2");
+        git(&repo, &["checkout", "-b", "child"]);
+        commit(&repo, "c1.txt", "c1");
+        git(&repo, &["checkout", "parent"]);
+        std::fs::write(repo.join("p2.txt"), "amended").unwrap();
+        git(&repo, &["commit", "-qa", "--amend", "-m", "p2 amended"]);
+
+        assert_parent(&repo, &["main", "parent", "child"], "child", "parent");
+    }
+
+    #[test]
+    fn without_reflog_a_moved_on_parent_loses_to_main() {
+        // Same shape as above, but the reflog is gone (expired, or a fresh
+        // clone): nothing tells the two cases apart, so main wins as before.
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo);
+        commit(&repo, "root.txt", "root");
+        git(&repo, &["checkout", "-b", "parent"]);
+        commit(&repo, "p1.txt", "p1");
+        git(&repo, &["checkout", "-b", "child"]);
+        commit(&repo, "c1.txt", "c1");
+        git(&repo, &["checkout", "parent"]);
+        commit(&repo, "p2.txt", "p2");
+        git(&repo, &["reflog", "expire", "--expire=now", "--all"]);
+
+        assert_parent(&repo, &["main", "parent", "child"], "child", "main");
+    }
+
+    #[test]
     fn diverged_branch_prefers_closer_candidate() {
         let tmp = tempfile::tempdir().unwrap();
         let repo = tmp.path().join("repo");
@@ -1287,6 +1446,14 @@ root
             shas: &[&str],
         ) -> Result<HashMap<String, (String, i64, String)>> {
             self.repo.commit_details_many(shas)
+        }
+
+        fn past_tips(&self, branch: &str) -> Result<Vec<String>> {
+            self.repo.past_tips(branch)
+        }
+
+        fn commits_between(&self, base: &str, head: &str) -> Result<HashSet<String>> {
+            self.repo.commits_between(base, head)
         }
     }
 

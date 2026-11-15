@@ -237,15 +237,32 @@ fn choose_rebase_base(
             format!("using {orig}: reparented from integrated branch"),
         );
     }
+    let is_ancestor = |a: &str, b: &str| {
+        repo.run_command_check(&["merge-base", "--is-ancestor", a, b])
+            .unwrap_or(false)
+    };
     let Some(fp) = stored_fp else {
+        // Nothing stored yet: ask the parent's reflog, like `git rebase
+        // --fork-point`. When the parent was amended or rebased after the
+        // branch was started on it, its old tip is newer than the merge-base
+        // and keeps the old version of its commits out of the rebase.
+        let reflog_fp = repo
+            .run_command(&["merge-base", "--fork-point", parent, branch])
+            .ok()
+            .map(|out| out.trim().to_string())
+            .filter(|fp| !fp.is_empty() && fp != merge_base && is_ancestor(merge_base, fp));
+        if let Some(fp) = reflog_fp {
+            return (
+                fp,
+                format!(
+                    "using {parent}'s reflog: it was rewritten after {branch} was started on it"
+                ),
+            );
+        }
         return (
             merge_base.to_string(),
             "using merge-base: no stored fork-point".to_string(),
         );
-    };
-    let is_ancestor = |a: &str, b: &str| {
-        repo.run_command_check(&["merge-base", "--is-ancestor", a, b])
-            .unwrap_or(false)
     };
     if !is_ancestor(fp, branch) {
         eprintln!(
