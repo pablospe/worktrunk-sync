@@ -167,6 +167,17 @@ pub struct SyncOptions {
     /// Use gh-stack's declared parents: `None` = when installed and used in
     /// this clone, `Some(true)` = required, `Some(false)` = ignore gh-stack.
     pub gh_stack: Option<bool>,
+    /// Instead of syncing, register the stacks with gh-stack.
+    pub gh_stack_init: Option<GhStackInit>,
+}
+
+/// What `--gh-stack-init` does with the `gh stack init` commands.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum GhStackInit {
+    /// Print them.
+    Print,
+    /// Run them (only prints with `--dry-run`).
+    Run,
 }
 
 /// Stack file name within the wt data directory.
@@ -951,6 +962,97 @@ fn gh_stack_parents(
     }
 }
 
+/// Split the selected part of the tree into stacks gh-stack can hold: one per
+/// child of the root, kept only when it is a straight line with no branch
+/// already in gh-stack. Returns the chains (bottom to top) and why each
+/// skipped stack was skipped.
+fn gh_stack_chains(
+    tree: &DependencyTree,
+    selected: &[&str],
+    registered: &HashSet<String>,
+) -> (Vec<Vec<String>>, Vec<String>) {
+    let mut chains = Vec::new();
+    let mut skipped = Vec::new();
+    let Some(root) = tree.nodes.get(&tree.root) else {
+        return (chains, skipped);
+    };
+    for bottom in root
+        .children
+        .iter()
+        .filter(|b| selected.contains(&b.as_str()))
+    {
+        let mut chain = vec![bottom.clone()];
+        let mut fan_out = None;
+        loop {
+            let top = chain.last().unwrap();
+            let children = tree.nodes.get(top).map_or(&[][..], |n| &n.children[..]);
+            match children {
+                [] => break,
+                [child] => chain.push(child.clone()),
+                _ => {
+                    fan_out = Some(format!(
+                        "{top} has {} branches on top of it ({}), and gh-stack stacks are a straight line",
+                        children.len(),
+                        children.join(", ")
+                    ));
+                    break;
+                }
+            }
+        }
+        if let Some(why) = fan_out {
+            skipped.push(format!("Skipping the stack starting at {bottom}: {why}"));
+        } else if let Some(known) = chain.iter().find(|b| registered.contains(*b)) {
+            skipped.push(format!(
+                "Skipping the stack starting at {bottom}: {known} is already in a gh-stack stack"
+            ));
+        } else {
+            chains.push(chain);
+        }
+    }
+    (chains, skipped)
+}
+
+/// `--gh-stack-init`: print (or run) `gh stack init` for each stack.
+fn register_with_gh_stack(
+    repo: &Repository,
+    tree: &DependencyTree,
+    selected: &[&str],
+    root_worktree: &Path,
+    mode: GhStackInit,
+    dry_run: bool,
+) -> anyhow::Result<()> {
+    let registered = gh_stack::registered_branches(repo.git_common_dir())?;
+    let (chains, skipped) = gh_stack_chains(tree, selected, &registered);
+    for why in &skipped {
+        eprintln!("{}", warning_message(why));
+    }
+    if chains.is_empty() {
+        eprintln!(
+            "{}",
+            success_message("No stacks to register with gh-stack.")
+        );
+        return Ok(());
+    }
+    let run = mode == GhStackInit::Run && !dry_run;
+    if run && !gh_stack::is_installed() {
+        bail!("gh-stack is not installed: gh extension install github/gh-stack");
+    }
+    for chain in &chains {
+        if run {
+            gh_stack::init(root_worktree, &tree.root, chain)?;
+        } else {
+            println!("gh stack init --base {} {}", tree.root, chain.join(" "));
+        }
+    }
+    if !run {
+        eprintln!(
+            "{}",
+            hint_message("Run these to register the stacks, or pass --gh-stack-init=run")
+        );
+    }
+    Ok(())
+}
+
 pub fn handle_sync(opts: SyncOptions) -> anyhow::Result<()> {
     let repo = Repository::current()?;
 
@@ -1004,6 +1106,17 @@ pub fn handle_sync(opts: SyncOptions) -> anyhow::Result<()> {
     } else {
         tree.topological_order()
     };
+
+    if let Some(mode) = opts.gh_stack_init {
+        return register_with_gh_stack(
+            &repo,
+            &tree,
+            &branches_to_sync,
+            &root_worktree,
+            mode,
+            opts.dry_run,
+        );
+    }
 
     if branches_to_sync.is_empty() && (!opts.prune || integrated.is_empty()) {
         let msg = if opts.push_only {
@@ -1892,5 +2005,36 @@ mod tests {
 
         assert_eq!(loaded.get("pr1").unwrap(), "abc123");
         assert_eq!(loaded.get("pr2").unwrap(), "def456");
+    }
+
+    #[test]
+    fn test_gh_stack_chains() {
+        // main -> a -> b, main -> c -> {d, e}, main -> f
+        let tree = make_tree(&[
+            ("main", None, &["a", "c", "f"]),
+            ("a", Some("main"), &["b"]),
+            ("b", Some("a"), &[]),
+            ("c", Some("main"), &["d", "e"]),
+            ("d", Some("c"), &[]),
+            ("e", Some("c"), &[]),
+            ("f", Some("main"), &[]),
+        ]);
+        let all = tree.topological_order();
+
+        let (chains, skipped) = gh_stack_chains(&tree, &all, &HashSet::new());
+        assert_eq!(chains, vec![vec!["a", "b"], vec!["f"]]);
+        assert_eq!(skipped.len(), 1);
+        assert!(skipped[0].contains("starting at c: c has 2 branches"));
+
+        let registered = HashSet::from(["b".to_string()]);
+        let (chains, skipped) = gh_stack_chains(&tree, &all, &registered);
+        assert_eq!(chains, vec![vec!["f"]]);
+        assert!(skipped[0].contains("b is already in a gh-stack stack"));
+
+        // Only the selected stack is considered.
+        let (chains, skipped) =
+            gh_stack_chains(&tree, &tree.stack_containing("b"), &HashSet::new());
+        assert_eq!(chains, vec![vec!["a", "b"]]);
+        assert!(skipped.is_empty());
     }
 }
