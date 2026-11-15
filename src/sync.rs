@@ -1473,34 +1473,92 @@ pub fn handle_sync(opts: SyncOptions) -> anyhow::Result<()> {
 }
 
 /// Branches that have an upstream, paired with the remote to push them to.
-fn push_targets(repo: &Repository, branches: &[&str]) -> Vec<(String, String)> {
-    branches
-        .iter()
-        .filter(|b| repo.branch(b).upstream().ok().flatten().is_some())
-        .map(|&b| {
-            let remote = repo
-                .branch(b)
-                .push_remote()
-                .unwrap_or_else(|| "origin".to_string());
-            (b.to_string(), remote)
-        })
-        .collect()
+/// Where one branch is pushed.
+struct PushTarget {
+    branch: String,
+    remote: String,
+    /// Branch name on the remote (differs only with `push.default=upstream`).
+    remote_branch: String,
 }
 
-/// Force-push (with lease) every branch that has an upstream, in the given order.
-/// Returns `(attempted, failed)` push counts.
+impl PushTarget {
+    fn refspec(&self) -> String {
+        if self.remote_branch == self.branch {
+            self.branch.clone()
+        } else {
+            format!("{}:{}", self.branch, self.remote_branch)
+        }
+    }
+}
+
+/// Branches to push, and a note for each branch with an upstream that is
+/// left alone.
+///
+/// The destination is git's own `@{push}`, so `wt sync -p` pushes exactly
+/// where `git push` would, and refuses where it would. A branch tracking
+/// another branch (say `upstream/main`, a repo you may not own) has no push
+/// destination under `push.default=simple` and is skipped, not force-pushed
+/// to its upstream's remote. Branches without an upstream are skipped
+/// silently, as before.
+fn push_targets(repo: &Repository, branches: &[&str]) -> (Vec<PushTarget>, Vec<String>) {
+    let refs: Vec<String> = branches.iter().map(|b| format!("refs/heads/{b}")).collect();
+    let mut args = vec![
+        "for-each-ref",
+        "--format=%(refname:strip=2)%00%(upstream:short)%00%(push)%00%(push:remotename)",
+    ];
+    args.extend(refs.iter().map(String::as_str));
+    let output = repo.run_command(&args).unwrap_or_default();
+    let mut found: HashMap<&str, (&str, &str, &str)> = HashMap::new();
+    for line in output.lines() {
+        let fields: Vec<&str> = line.split('\0').collect();
+        if let [branch, upstream, push, remote] = fields[..] {
+            found.insert(branch, (upstream, push, remote));
+        }
+    }
+
+    let mut targets = Vec::new();
+    let mut skipped = Vec::new();
+    for &branch in branches {
+        let Some(&(upstream, push, remote)) = found.get(branch) else {
+            continue;
+        };
+        if upstream.is_empty() {
+            continue;
+        }
+        let remote_branch = push
+            .strip_prefix(&format!("refs/remotes/{remote}/"))
+            .filter(|_| !remote.is_empty());
+        match remote_branch {
+            Some(remote_branch) => targets.push(PushTarget {
+                branch: branch.to_string(),
+                remote: remote.to_string(),
+                remote_branch: remote_branch.to_string(),
+            }),
+            None => skipped.push(format!(
+                "Not pushing {branch}: it tracks {upstream}, so git has no single place to push it. Push it once with `git push -u <remote> {branch}` to choose one."
+            )),
+        }
+    }
+    (targets, skipped)
+}
+
 fn push_branches(repo: &Repository, branches: &[&str]) -> (usize, usize) {
-    let targets = push_targets(repo, branches);
+    let (targets, skipped) = push_targets(repo, branches);
     let mut failed = 0;
-    if !targets.is_empty() {
+    if !targets.is_empty() || !skipped.is_empty() {
         eprintln!();
     }
-    for (branch, remote) in &targets {
+    for why in &skipped {
+        eprintln!("{}", hint_message(why));
+    }
+    for target in &targets {
+        let PushTarget { branch, remote, .. } = target;
         eprintln!(
             "{}",
             progress_message(cformat!("Pushing <bold>{branch}</> to {remote}..."))
         );
-        let result = repo.run_command(&["push", "--force-with-lease", remote, branch]);
+        let refspec = target.refspec();
+        let result = repo.run_command(&["push", "--force-with-lease", remote, &refspec]);
         match result {
             Ok(_) => {
                 eprintln!("{}", success_message(cformat!("Pushed <bold>{branch}</>")));
@@ -1545,16 +1603,11 @@ fn print_sync_plan(
     eprintln!("Planned operations:");
 
     if opts.push_only {
-        let targets = push_targets(repo, branches);
+        let (targets, skipped) = push_targets(repo, branches);
         if targets.is_empty() {
             eprintln!("  (none)");
         }
-        for (branch, remote) in &targets {
-            eprintln!("  push {branch} to {remote}");
-            if opts.verbose {
-                eprintln!("    $ git push --force-with-lease {remote} {branch}");
-            }
-        }
+        print_push_plan(&targets, &skipped, opts.verbose);
         return;
     }
 
@@ -1624,16 +1677,11 @@ fn print_sync_plan(
     // Pushes and removals are listed even without --verbose: a preview that
     // leaves out what gets deleted is not a preview. --verbose adds commands.
     if opts.push {
-        let targets = push_targets(repo, branches);
-        if !targets.is_empty() {
+        let (targets, skipped) = push_targets(repo, branches);
+        if !targets.is_empty() || !skipped.is_empty() {
             eprintln!();
             eprintln!("Push:");
-            for (branch, remote) in &targets {
-                eprintln!("  push {branch} to {remote}");
-                if opts.verbose {
-                    eprintln!("    $ git push --force-with-lease {remote} {branch}");
-                }
-            }
+            print_push_plan(&targets, &skipped, opts.verbose);
         }
     }
     if opts.prune && !integrated.is_empty() {
@@ -1683,6 +1731,22 @@ fn print_sync_plan(
                 "Dry run: nothing was fetched, so branches merged on the remote since your last fetch are not shown. The real run fetches first and may prune more."
             )
         );
+    }
+}
+
+fn print_push_plan(targets: &[PushTarget], skipped: &[String], verbose: bool) {
+    for target in targets {
+        eprintln!("  push {} to {}", target.branch, target.remote);
+        if verbose {
+            eprintln!(
+                "    $ git push --force-with-lease {} {}",
+                target.remote,
+                target.refspec()
+            );
+        }
+    }
+    for why in skipped {
+        eprintln!("  {why}");
     }
 }
 
