@@ -94,6 +94,15 @@ If you registered branches with `gh stack init` or `gh stack add`, `wt sync` use
 
 `wt sync` only reads gh-stack's catalog (`.git/gh-stack`). It never writes it and never runs `gh stack sync`, `push` or `submit`. It also refuses to run while a `gh stack rebase` or `modify` is paused, since those branches are mid-rewrite. If gh-stack isn't installed, nothing changes. Pass `--no-gh-stack` to ignore gh-stack and infer every parent.
 
+To go the other way and hand stacks wt-sync worked out to gh-stack, so you can open them as stacked PRs with `gh stack submit`:
+
+```bash
+wt sync --gh-stack-init --all       # print a `gh stack init` command per stack
+wt sync --gh-stack-init=run --all   # run them
+```
+
+This only registers the stacks; nothing is rebased or pushed. gh-stack stacks are a straight line, so a stack where a branch has several branches on top of it is skipped with a warning, and so is a stack with a branch that is already in gh-stack. The default is to print, because running `gh stack init` writes gh-stack's catalog and lets gh-stack set up the repo the way it wants.
+
 ### Flags
 
 | Flag | Short | Description |
@@ -109,6 +118,7 @@ If you registered branches with `gh stack init` or `gh stack add`, `wt sync` use
 | `--verbose` | `-v` | Show git commands that would be executed |
 | `--dry-run` | `-n` | Preview the sync plan without executing |
 | `--no-gh-stack` | | Ignore stacks declared in [gh-stack](#gh-stack) |
+| `--gh-stack-init[=run]` | | Print (or run) `gh stack init` for each stack instead of syncing, see [gh-stack](#gh-stack) |
 
 ## Example
 

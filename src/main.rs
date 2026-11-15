@@ -93,6 +93,33 @@ struct Cli {
     /// Ignore gh-stack: infer every parent from git history
     #[arg(long = "no-gh-stack", overrides_with = "gh_stack")]
     no_gh_stack: bool,
+
+    /// Print `gh stack init` for each stack instead of syncing
+    ///
+    /// Registers the stacks wt-sync worked out with gh-stack, so they can be
+    /// submitted as stacked PRs with `gh stack submit`. Only straight-line
+    /// stacks qualify; a stack with a branch that has several branches on top
+    /// of it, or with a branch already in gh-stack, is skipped. With `=run`
+    /// the commands are run instead of printed, which writes gh-stack's
+    /// catalog and lets gh-stack configure the repo.
+    #[arg(
+        long,
+        value_enum,
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "print",
+        value_name = "MODE",
+        conflicts_with_all = ["fetch", "pull", "push", "push_only", "prune", "no_gh_stack"]
+    )]
+    gh_stack_init: Option<GhStackInitArg>,
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum GhStackInitArg {
+    /// Print the commands
+    Print,
+    /// Run the commands
+    Run,
 }
 
 fn flag_pair(positive: bool, negative: bool) -> Option<bool> {
@@ -133,6 +160,10 @@ fn main() {
         verbose: args.verbose,
         dry_run: args.dry_run,
         gh_stack: flag_pair(args.gh_stack, args.no_gh_stack),
+        gh_stack_init: args.gh_stack_init.map(|mode| match mode {
+            GhStackInitArg::Print => sync::GhStackInit::Print,
+            GhStackInitArg::Run => sync::GhStackInit::Run,
+        }),
     };
 
     if let Err(e) = sync::handle_sync(opts) {
@@ -196,6 +227,20 @@ mod tests {
             assert!(
                 Cli::try_parse_from(["wt-sync", "--push-only", flag]).is_err(),
                 "--push-only should conflict with {flag}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_gh_stack_init_parses() {
+        let args = Cli::try_parse_from(["wt-sync", "--gh-stack-init"]).unwrap();
+        assert!(matches!(args.gh_stack_init, Some(GhStackInitArg::Print)));
+        let args = Cli::try_parse_from(["wt-sync", "--gh-stack-init=run", "-a"]).unwrap();
+        assert!(matches!(args.gh_stack_init, Some(GhStackInitArg::Run)));
+        for flag in ["--push", "--pull", "--fetch", "--prune", "--no-gh-stack"] {
+            assert!(
+                Cli::try_parse_from(["wt-sync", "--gh-stack-init", flag]).is_err(),
+                "--gh-stack-init should conflict with {flag}"
             );
         }
     }

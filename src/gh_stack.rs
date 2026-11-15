@@ -3,10 +3,11 @@
 //! gh-stack keeps the stacks a user registered (`gh stack init` / `add`) in a
 //! JSON catalog at `<git-common-dir>/gh-stack`. Its declared order is used as
 //! parent hints: a declared parent beats the stack file and inference. The
-//! catalog is never written, and gh-stack itself is never run except for an
-//! installation check.
+//! catalog is never written here; gh-stack itself only runs for an
+//! installation check, and for `gh stack init` when `--gh-stack-init=run`
+//! asks for it.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::process::Command;
 
@@ -72,17 +73,24 @@ pub fn read_catalog(common_dir: &Path) -> Catalog {
     }
 }
 
-fn parse_catalog(content: &str) -> Catalog {
-    let file: CatalogFile = match serde_json::from_str(content) {
-        Ok(file) => file,
-        Err(e) => return Catalog::Unsupported(format!("invalid catalog: {e}")),
-    };
+/// Parse and version-check the catalog, or say why it can't be used.
+fn parse_file(content: &str) -> Result<CatalogFile, String> {
+    let file: CatalogFile =
+        serde_json::from_str(content).map_err(|e| format!("invalid catalog: {e}"))?;
     if file.schema_version != SCHEMA_VERSION {
-        return Catalog::Unsupported(format!(
+        return Err(format!(
             "catalog schema version {} (only {SCHEMA_VERSION} is supported)",
             file.schema_version
         ));
     }
+    Ok(file)
+}
+
+fn parse_catalog(content: &str) -> Catalog {
+    let file = match parse_file(content) {
+        Ok(file) => file,
+        Err(why) => return Catalog::Unsupported(why),
+    };
 
     // Each branch's parent is the nearest unmerged branch below it, or the
     // stack's trunk. Merged branches get no entry: they are integrated, and
@@ -103,6 +111,41 @@ fn parse_catalog(content: &str) -> Catalog {
         }
     }
     Catalog::Parents(parents)
+}
+
+/// Every branch the catalog mentions, trunks and merged branches included.
+/// Errors on a catalog that can't be read, so nothing gets registered twice.
+pub fn registered_branches(common_dir: &Path) -> anyhow::Result<HashSet<String>> {
+    let path = common_dir.join(CATALOG_FILE);
+    let content = match std::fs::read_to_string(&path) {
+        Ok(content) => content,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(HashSet::new()),
+        Err(e) => anyhow::bail!("cannot read {}: {e}", path.display()),
+    };
+    let file = parse_file(&content).map_err(|why| anyhow::anyhow!("gh-stack: {why}"))?;
+    Ok(file
+        .stacks
+        .into_iter()
+        .flat_map(|stack| std::iter::once(stack.trunk).chain(stack.branches))
+        .map(|branch| branch.branch)
+        .collect())
+}
+
+/// Run `gh stack init --base <trunk> <branches...>` from `dir`. gh-stack
+/// prints its own progress; stdin is closed so it can never prompt.
+pub fn init(dir: &Path, trunk: &str, branches: &[String]) -> anyhow::Result<()> {
+    let status = Command::new("gh")
+        .args(["stack", "init", "--base", trunk])
+        .args(branches)
+        .current_dir(dir)
+        .env("GH_STACK_NO_UPDATE_NOTIFIER", "1")
+        .stdin(std::process::Stdio::null())
+        .status()
+        .map_err(|e| anyhow::anyhow!("cannot run gh: {e}"))?;
+    if !status.success() {
+        anyhow::bail!("gh stack init {} failed", branches.join(" "));
+    }
+    Ok(())
 }
 
 /// The paused gh-stack operation in `common_dir`, if any ("rebase" or "modify").
@@ -177,6 +220,22 @@ mod tests {
             Catalog::Unsupported(_)
         ));
         assert!(matches!(parse_catalog("not json"), Catalog::Unsupported(_)));
+    }
+
+    #[test]
+    fn registered_branches_include_trunks_and_merged() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(registered_branches(dir.path()).unwrap().is_empty());
+        std::fs::write(
+            dir.path().join(CATALOG_FILE),
+            r#"{"schemaVersion":1,"stacks":[{"trunk":{"branch":"develop"},
+                "branches":[{"branch":"a","pullRequest":{"merged":true}},{"branch":"b"}]}]}"#,
+        )
+        .unwrap();
+        let got = registered_branches(dir.path()).unwrap();
+        assert_eq!(got, HashSet::from(["develop", "a", "b"].map(String::from)));
+        std::fs::write(dir.path().join(CATALOG_FILE), "not json").unwrap();
+        assert!(registered_branches(dir.path()).is_err());
     }
 
     #[test]

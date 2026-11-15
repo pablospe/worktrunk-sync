@@ -73,12 +73,34 @@ impl Fixture {
         fixture
     }
 
-    /// Fake `gh`: `gh stack --version` succeeds only when installed.
+    /// Fake `gh`: succeeds only when installed, and logs its arguments.
     fn set_gh_installed(&self, installed: bool) {
         let path = self.bin.join("gh");
         let code = if installed { 0 } else { 1 };
-        std::fs::write(&path, format!("#!/bin/sh\nexit {code}\n")).unwrap();
+        let log = self.gh_log();
+        std::fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\necho \"$*\" >> '{}'\nexit {code}\n",
+                log.display()
+            ),
+        )
+        .unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    fn gh_log(&self) -> PathBuf {
+        self.bin.join("gh.log")
+    }
+
+    /// The `gh` calls that ran something other than the installation check.
+    fn gh_calls(&self) -> Vec<String> {
+        std::fs::read_to_string(self.gh_log())
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| *line != "stack --version")
+            .map(String::from)
+            .collect()
     }
 
     /// Write gh-stack's catalog declaring the stack `main <- a <- b`.
@@ -204,4 +226,70 @@ fn paused_gh_stack_rebase_blocks_the_sync() {
 
     // --no-gh-stack opts out of the guard along with the hints.
     f.plan(&["--all", "-n", "--no-gh-stack"]);
+}
+
+#[test]
+fn gh_stack_init_prints_the_commands() {
+    let f = Fixture::new(true);
+    let (output, text) = f.wt_sync(&["--all", "--gh-stack-init"]);
+    assert!(output.status.success(), "{text}");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "gh stack init --base main a b"
+    );
+    assert!(f.gh_calls().is_empty(), "{:?}", f.gh_calls());
+    // Printing never syncs: no stack file is written.
+    assert!(!f.repo.join(".git/wt/stack").exists());
+}
+
+#[test]
+fn gh_stack_init_run_runs_them() {
+    let f = Fixture::new(true);
+    let (output, text) = f.wt_sync(&["--all", "--gh-stack-init=run", "-n"]);
+    assert!(output.status.success(), "{text}");
+    assert!(
+        f.gh_calls().is_empty(),
+        "dry run ran gh: {:?}",
+        f.gh_calls()
+    );
+
+    let (output, text) = f.wt_sync(&["--all", "--gh-stack-init=run"]);
+    assert!(output.status.success(), "{text}");
+    assert_eq!(f.gh_calls(), ["stack init --base main a b"]);
+}
+
+#[test]
+fn gh_stack_init_skips_registered_and_fan_out_stacks() {
+    let f = Fixture::new(true);
+    f.declare_a_then_b();
+    let (output, text) = f.wt_sync(&["--all", "--gh-stack-init"]);
+    assert!(output.status.success(), "{text}");
+    assert!(text.contains("a is already in a gh-stack stack"), "{text}");
+    assert!(String::from_utf8_lossy(&output.stdout).trim().is_empty());
+
+    // main -> x -> {y, z}: gh-stack can't hold it.
+    let f = Fixture::new(false);
+    let tmp = f.repo.parent().unwrap();
+    let x = tmp.join("wt-x");
+    git(
+        &f.repo,
+        &["worktree", "add", "-b", "x", &x.to_string_lossy()],
+    );
+    commit_file(&x, "x.txt");
+    for name in ["y", "z"] {
+        let wt = tmp.join(format!("wt-{name}"));
+        git(
+            &f.repo,
+            &["worktree", "add", "-b", name, &wt.to_string_lossy(), "x"],
+        );
+        commit_file(&wt, &format!("{name}.txt"));
+    }
+    let (output, text) = f.wt_sync(&["--all", "--gh-stack-init"]);
+    assert!(output.status.success(), "{text}");
+    assert!(text.contains("x has 2 branches on top of it"), "{text}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(
+        stdout.lines().collect::<Vec<_>>(),
+        ["gh stack init --base main a", "gh stack init --base main b"]
+    );
 }
