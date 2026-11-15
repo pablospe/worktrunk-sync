@@ -1566,44 +1566,68 @@ fn print_sync_plan(
         );
     }
 
-    if opts.verbose {
-        if opts.push {
-            let targets = push_targets(repo, branches);
-            if !targets.is_empty() {
-                eprintln!();
-                eprintln!("Push:");
-                for (branch, remote) in &targets {
+    // Pushes and removals are listed even without --verbose: a preview that
+    // leaves out what gets deleted is not a preview. --verbose adds commands.
+    if opts.push {
+        let targets = push_targets(repo, branches);
+        if !targets.is_empty() {
+            eprintln!();
+            eprintln!("Push:");
+            for (branch, remote) in &targets {
+                eprintln!("  push {branch} to {remote}");
+                if opts.verbose {
                     eprintln!("    $ git push --force-with-lease {remote} {branch}");
                 }
             }
         }
-        if opts.prune && !integrated.is_empty() {
-            eprintln!();
-            eprintln!("Prune:");
-            for IntegratedBranch {
-                branch,
-                path,
-                merged_upstream,
-            } in integrated
-            {
-                let has_upstream = repo.branch(branch).upstream().ok().flatten().is_some();
-                let prune_remote = repo
-                    .branch(branch)
-                    .push_remote()
-                    .unwrap_or_else(|| "origin".to_string());
+    }
+    if opts.prune && !integrated.is_empty() {
+        eprintln!();
+        eprintln!("Prune (integrated branches):");
+        for IntegratedBranch {
+            branch,
+            path,
+            merged_upstream,
+        } in integrated
+        {
+            let has_upstream = repo.branch(branch).upstream().ok().flatten().is_some();
+            let prune_remote = repo
+                .branch(branch)
+                .push_remote()
+                .unwrap_or_else(|| "origin".to_string());
+            let deletes_remote = has_upstream && *merged_upstream;
+            let remote_note = if deletes_remote {
+                format!(", and {prune_remote}/{branch}")
+            } else {
+                String::new()
+            };
+            eprintln!(
+                "  remove {branch}: worktree {}{remote_note}",
+                path.to_string_lossy()
+            );
+            if opts.verbose {
                 let force_flag = if opts.force { " --force" } else { "" };
                 eprintln!(
                     "    $ git worktree remove{force_flag} {}",
                     path.to_string_lossy()
                 );
                 eprintln!("    $ git branch -D {branch}");
-                if has_upstream && *merged_upstream {
+                if deletes_remote {
                     eprintln!("    $ git push {prune_remote} --delete {branch}");
                 } else if has_upstream {
                     eprintln!("    # keep {prune_remote}/{branch}: merge not on the remote yet");
                 }
             }
         }
+    }
+    if opts.fetch {
+        eprintln!();
+        eprintln!(
+            "{}",
+            hint_message(
+                "Dry run: nothing was fetched, so branches merged on the remote since your last fetch are not shown. The real run fetches first and may prune more."
+            )
+        );
     }
 }
 

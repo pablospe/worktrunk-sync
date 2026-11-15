@@ -355,3 +355,28 @@ fn test_prune_deletes_remote_branch_when_merge_is_pushed() {
         "remote branch should be deleted, got {remote:?}, stderr:\n{stderr}"
     );
 }
+
+#[test]
+fn test_dry_run_lists_removals_without_verbose() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    let wt_path = setup_repo_with_integrated_branch(tmp.path());
+
+    let output = Command::new(wt_sync_bin())
+        .args(["--prune", "--all", "-n"])
+        .current_dir(&repo)
+        .env("NO_COLOR", "1")
+        .output()
+        .expect("failed to run wt-sync");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains(&format!("remove feature: worktree {}", wt_path.display())),
+        "dry run should say feature will be removed:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("$ git"),
+        "commands are for -v only:\n{stderr}"
+    );
+    assert!(wt_path.exists(), "dry run must not remove anything");
+}
