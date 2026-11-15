@@ -1320,6 +1320,15 @@ pub fn handle_sync(opts: SyncOptions) -> anyhow::Result<()> {
             eprintln!("{}", hint_message(reason));
         }
 
+        let merges = merge_commits(&repo, &rebase_base, parent, branch);
+        if merges > 0 {
+            conflicted.insert(branch);
+            eprintln!(
+                "{}",
+                warning_message(merge_skip_reason(branch, parent, merges))
+            );
+            continue;
+        }
         if let Some(files) = would_conflict(&repo, &rebase_base, parent, branch) {
             conflicted.insert(branch);
             eprintln!(
@@ -1504,7 +1513,7 @@ pub fn handle_sync(opts: SyncOptions) -> anyhow::Result<()> {
         let mut names: Vec<&str> = conflicted.into_iter().collect();
         names.sort();
         bail!(
-            "{} not rebased because of conflicts: {}",
+            "{} not rebased (conflicts or merge commits): {}",
             if names.len() == 1 {
                 "1 branch"
             } else {
@@ -1578,6 +1587,41 @@ fn would_conflict(
         .collect();
     files.dedup();
     Some(files)
+}
+
+/// Merge commits a rebase of `branch` from `base` onto `onto` would flatten.
+/// A plain rebase drops merges and replays the merged commits one by one, so
+/// an integration branch built from hand-resolved merges loses its
+/// resolutions and conflicts again; such a branch is skipped instead.
+///
+/// A merge whose merged-in side is already in `onto` (catching up by merging
+/// `main` into a feature branch) doesn't count: the rebase drops those
+/// commits as already upstream and loses nothing.
+fn merge_commits(repo: &Repository, base: &str, onto: &str, branch: &str) -> usize {
+    let range = format!("{base}..{branch}");
+    let Ok(out) = repo.run_command(&["rev-list", "--merges", "--parents", &range]) else {
+        return 0;
+    };
+    out.lines()
+        .filter(|line| {
+            line.split_whitespace().skip(2).any(|merged| {
+                !repo
+                    .run_command_check(&["merge-base", "--is-ancestor", merged, onto])
+                    .unwrap_or(false)
+            })
+        })
+        .count()
+}
+
+fn merge_skip_reason(branch: &str, parent: &str, merges: usize) -> String {
+    let commits = if merges == 1 {
+        "a merge commit".to_string()
+    } else {
+        format!("{merges} merge commits")
+    };
+    format!(
+        "Skipping {branch}: it has {commits}, which a rebase would flatten. Rebase it by hand (`git rebase --rebase-merges {parent}` in its worktree), then run wt sync."
+    )
 }
 
 /// Why a branch is left out of this run's rebases.
@@ -1736,6 +1780,8 @@ fn print_sync_plan(
     let mut printed = false;
     let mut has_rebases = false;
     let mut conflicted: HashSet<&str> = HashSet::new();
+    // Branches the real run moves: rebased ones and everything above them.
+    let mut moving: HashSet<&str> = HashSet::new();
     for &branch in branches {
         let Some(node) = tree.nodes.get(branch) else {
             continue;
@@ -1749,6 +1795,7 @@ fn print_sync_plan(
             printed = true;
             continue;
         }
+        let parent_moves = moving.contains(parent.as_str());
 
         // Same up-to-date check as the real run, against the parent's current
         // tip. With a pending `--pull` fast-forward the real run moves the root
@@ -1765,11 +1812,24 @@ fn print_sync_plan(
             .run_command(&["rev-parse", parent_rev])
             .map(|s| s.trim().to_string())
             .unwrap_or_default();
+        // Shown as up to date against the parent's current tip, but the real
+        // run rebases it once the parent has moved, so merges count here too.
+        if parent_moves {
+            moving.insert(branch);
+            let merges = merge_commits(repo, &mb, parent_rev, branch);
+            if merges > 0 {
+                conflicted.insert(branch);
+                eprintln!("  {}", merge_skip_reason(branch, parent, merges));
+                printed = true;
+                continue;
+            }
+        }
         if mb == parent_sha {
             eprintln!("  {branch} is up to date with {parent}");
             printed = true;
             continue;
         }
+        moving.insert(branch);
 
         let (base, reason) = choose_rebase_base(
             repo,
@@ -1779,6 +1839,13 @@ fn print_sync_plan(
             fork_points.get(branch).map(String::as_str),
             &mb,
         );
+        let merges = merge_commits(repo, &base, parent_rev, branch);
+        if merges > 0 {
+            conflicted.insert(branch);
+            eprintln!("  {}", merge_skip_reason(branch, parent, merges));
+            printed = true;
+            continue;
+        }
         if let Some(files) = would_conflict(repo, &base, parent_rev, branch) {
             conflicted.insert(branch);
             eprintln!("  {}", conflict_skip_reason(branch, parent, &files));
