@@ -105,7 +105,7 @@ fn conflicting_branch_is_skipped_and_the_rest_is_synced() {
     );
     assert!(text.contains("Rebased fine onto main"), "{text}");
     assert!(
-        text.contains("not rebased because of conflicts: on-stale, stale"),
+        text.contains("not rebased (conflicts or merge commits): on-stale, stale"),
         "{text}"
     );
     // stale's worktree was never touched: same commit, no rebase in progress.
@@ -129,4 +129,60 @@ fn running_from_main_says_it_syncs_every_stack() {
     );
     let (_, plan) = wt_sync(&repo, &["-n", "--all"]);
     assert!(!plan.contains("syncing all"), "--all asked for it:\n{plan}");
+}
+
+#[test]
+fn branch_with_merge_commits_is_not_flattened() {
+    // Like diffnav's all-features: integration sits on a and merges in a
+    // sibling, b. main then moves, so a is rebased and integration would be.
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "-q", "-b", "main"]);
+    write_commit(&repo, "base.txt", "base");
+    let a = add_worktree(&repo, "a", "main");
+    write_commit(&a, "a.txt", "a");
+    let b = add_worktree(&repo, "b", "main");
+    write_commit(&b, "b.txt", "b");
+    let integration = add_worktree(&repo, "integration", "a");
+    write_commit(&integration, "i.txt", "i");
+    git(
+        &integration,
+        &["merge", "-q", "--no-ff", "-m", "merge b", "b"],
+    );
+    write_commit(&repo, "main.txt", "main moves");
+    let before = git(&repo, &["rev-parse", "integration"]);
+
+    let (_, plan) = wt_sync(&repo, &["--all", "-n"]);
+    assert!(
+        plan.contains("Skipping integration: it has a merge commit, which a rebase would flatten"),
+        "{plan}"
+    );
+
+    let (output, text) = wt_sync(&repo, &["--all"]);
+    assert!(!output.status.success(), "{text}");
+    assert!(text.contains("Rebased a onto main"), "{text}");
+    assert!(text.contains("Rebased b onto main"), "{text}");
+    assert_eq!(git(&repo, &["rev-parse", "integration"]), before);
+}
+
+#[test]
+fn merging_main_into_a_branch_does_not_block_its_rebase() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "-q", "-b", "main"]);
+    write_commit(&repo, "base.txt", "base");
+    let feature = add_worktree(&repo, "feature", "main");
+    write_commit(&feature, "f.txt", "f");
+    write_commit(&repo, "m1.txt", "m1");
+    git(
+        &feature,
+        &["merge", "-q", "--no-ff", "-m", "catch up", "main"],
+    );
+    write_commit(&repo, "m2.txt", "m2");
+
+    let (output, text) = wt_sync(&repo, &["--all"]);
+    assert!(output.status.success(), "{text}");
+    assert!(text.contains("Rebased feature onto main"), "{text}");
 }
