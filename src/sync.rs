@@ -1148,6 +1148,9 @@ pub fn handle_sync(opts: SyncOptions) -> anyhow::Result<()> {
             bail!("Current worktree has no branch. Use --all to sync all branches.");
         };
         let stack = tree.stack_containing(current);
+        if current == &tree.root {
+            announce_every_stack(&tree);
+        }
         if stack.is_empty() {
             eprintln!(
                 "{}",
@@ -1263,6 +1266,9 @@ pub fn handle_sync(opts: SyncOptions) -> anyhow::Result<()> {
     // Execute rebases in topological order
     let mut rebased_count = 0;
     let mut skipped_count = 0;
+    // Branches left alone because they (or a branch below them) would
+    // conflict. Not rebased, not pushed, fork-points untouched.
+    let mut conflicted: HashSet<&str> = HashSet::new();
 
     for &branch in &branches_to_sync {
         let Some(node) = tree.nodes.get(branch) else {
@@ -1271,6 +1277,16 @@ pub fn handle_sync(opts: SyncOptions) -> anyhow::Result<()> {
         let Some(ref parent) = node.parent else {
             continue; // root node
         };
+        if conflicted.contains(parent.as_str()) {
+            conflicted.insert(branch);
+            eprintln!(
+                "{}",
+                warning_message(cformat!(
+                    "Skipping <bold>{branch}</>: its parent <bold>{parent}</> was skipped"
+                ))
+            );
+            continue;
+        }
 
         let wt = repo.worktree_at(&node.path);
 
@@ -1302,6 +1318,15 @@ pub fn handle_sync(opts: SyncOptions) -> anyhow::Result<()> {
         );
         if opts.verbose {
             eprintln!("{}", hint_message(reason));
+        }
+
+        if let Some(files) = would_conflict(&repo, &rebase_base, parent, branch) {
+            conflicted.insert(branch);
+            eprintln!(
+                "{}",
+                warning_message(conflict_skip_reason(branch, parent, &files))
+            );
+            continue;
         }
 
         eprintln!(
@@ -1364,9 +1389,14 @@ pub fn handle_sync(opts: SyncOptions) -> anyhow::Result<()> {
         );
     }
 
-    // Push all branches with an upstream
+    // Push all branches with an upstream, except the ones left un-rebased.
     if opts.push {
-        push_branches(&repo, &branches_to_sync);
+        let to_push: Vec<&str> = branches_to_sync
+            .iter()
+            .copied()
+            .filter(|b| !conflicted.contains(b))
+            .collect();
+        push_branches(&repo, &to_push);
     }
 
     // Prune integrated worktrees
@@ -1469,10 +1499,101 @@ pub fn handle_sync(opts: SyncOptions) -> anyhow::Result<()> {
     // Persist fork-points for next sync
     save_fork_points(&repo, &fork_points)?;
 
+    // Non-zero, so `wt sync && ...` stops here like it does on a conflict.
+    if !conflicted.is_empty() {
+        let mut names: Vec<&str> = conflicted.into_iter().collect();
+        names.sort();
+        bail!(
+            "{} not rebased because of conflicts: {}",
+            if names.len() == 1 {
+                "1 branch"
+            } else {
+                "branches"
+            },
+            names.join(", ")
+        );
+    }
+
     Ok(())
 }
 
 /// Branches that have an upstream, paired with the remote to push them to.
+/// Run from the default branch, "the current stack" is every stack, which is
+/// a lot to do implicitly (with `-P` it also removes worktrees). Say so.
+fn announce_every_stack(tree: &DependencyTree) {
+    let Some(root) = tree.nodes.get(&tree.root) else {
+        return;
+    };
+    if root.children.len() < 2 {
+        return;
+    }
+    eprintln!(
+        "{}",
+        hint_message(format!(
+            "On {}, so syncing all {} stacks: {}. Run from a stack's worktree to sync only that one.",
+            tree.root,
+            root.children.len(),
+            root.children.join(", ")
+        ))
+    );
+}
+
+/// Files that would conflict if `branch` (from `base`) were replayed onto
+/// `parent`, from `git merge-tree`, which touches no worktree. `None` when the
+/// result is clean, or when the check can't run (git older than 2.40): the
+/// rebase itself still stops on a real conflict.
+///
+/// A rebase replays commit by commit and this checks the end result, so in
+/// rare cases one conflicts and the other doesn't; it is a guard, not a proof.
+fn would_conflict(
+    repo: &Repository,
+    base: &str,
+    parent: &str,
+    branch: &str,
+) -> Option<Vec<String>> {
+    let output = std::process::Command::new("git")
+        .args([
+            "merge-tree",
+            "--write-tree",
+            "--name-only",
+            "--no-messages",
+            "--merge-base",
+            base,
+            parent,
+            branch,
+        ])
+        .current_dir(repo.repo_path().ok()?)
+        .output()
+        .ok()?;
+    // Exit 1 means conflicts; 0 is clean; anything else is an error.
+    if output.status.code() != Some(1) {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut files: Vec<String> = stdout
+        .lines()
+        .skip(1) // the tree OID
+        .take_while(|line| !line.is_empty())
+        .map(str::to_owned)
+        .collect();
+    files.dedup();
+    Some(files)
+}
+
+/// Why a branch is left out of this run's rebases.
+fn conflict_skip_reason(branch: &str, parent: &str, files: &[String]) -> String {
+    let shown: Vec<&str> = files.iter().take(3).map(String::as_str).collect();
+    let more = files.len().saturating_sub(shown.len());
+    let list = if more > 0 {
+        format!("{} and {more} more", shown.join(", "))
+    } else {
+        shown.join(", ")
+    };
+    format!(
+        "Skipping {branch}: rebasing it onto {parent} would conflict in {list}. Rebase it by hand (`git rebase {parent}` in its worktree), then run wt sync."
+    )
+}
+
 /// Where one branch is pushed.
 struct PushTarget {
     branch: String,
@@ -1614,6 +1735,7 @@ fn print_sync_plan(
     let fork_points = load_fork_points(repo);
     let mut printed = false;
     let mut has_rebases = false;
+    let mut conflicted: HashSet<&str> = HashSet::new();
     for &branch in branches {
         let Some(node) = tree.nodes.get(branch) else {
             continue;
@@ -1621,6 +1743,12 @@ fn print_sync_plan(
         let Some(ref parent) = node.parent else {
             continue;
         };
+        if conflicted.contains(parent.as_str()) {
+            conflicted.insert(branch);
+            eprintln!("  Skipping {branch}: its parent {parent} would be skipped");
+            printed = true;
+            continue;
+        }
 
         // Same up-to-date check as the real run, against the parent's current
         // tip. With a pending `--pull` fast-forward the real run moves the root
@@ -1651,6 +1779,12 @@ fn print_sync_plan(
             fork_points.get(branch).map(String::as_str),
             &mb,
         );
+        if let Some(files) = would_conflict(repo, &base, parent_rev, branch) {
+            conflicted.insert(branch);
+            eprintln!("  {}", conflict_skip_reason(branch, parent, &files));
+            printed = true;
+            continue;
+        }
         if let Some(ref orig_parent) = node.original_parent {
             eprintln!(
                 "  rebase {branch} onto {parent}  (reparented from integrated {orig_parent})"
@@ -1677,7 +1811,12 @@ fn print_sync_plan(
     // Pushes and removals are listed even without --verbose: a preview that
     // leaves out what gets deleted is not a preview. --verbose adds commands.
     if opts.push {
-        let (targets, skipped) = push_targets(repo, branches);
+        let to_push: Vec<&str> = branches
+            .iter()
+            .copied()
+            .filter(|b| !conflicted.contains(b))
+            .collect();
+        let (targets, skipped) = push_targets(repo, &to_push);
         if !targets.is_empty() || !skipped.is_empty() {
             eprintln!();
             eprintln!("Push:");
