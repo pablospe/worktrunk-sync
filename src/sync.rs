@@ -25,7 +25,7 @@
 //! - `--pull` fetches and fast-forwards the root branch to its upstream first
 //! - Stops on first conflict; user resolves and re-runs
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context};
@@ -38,6 +38,8 @@ use worktrunk::git::{
 use worktrunk::styling::{
     eprintln, error_message, hint_message, progress_message, success_message, warning_message,
 };
+
+use crate::gh_stack::{self, Catalog};
 
 /// A branch whose work is already in its target (removed with `--prune`).
 #[derive(Debug)]
@@ -69,6 +71,8 @@ struct DependencyTree {
     root: String,
     /// All nodes indexed by branch name.
     nodes: HashMap<String, TreeNode>,
+    /// Branches whose parent was declared in gh-stack.
+    gh_stack: HashSet<String>,
 }
 
 impl DependencyTree {
@@ -160,6 +164,9 @@ pub struct SyncOptions {
     pub force: bool,
     pub verbose: bool,
     pub dry_run: bool,
+    /// Use gh-stack's declared parents: `None` = when installed and used in
+    /// this clone, `Some(true)` = required, `Some(false)` = ignore gh-stack.
+    pub gh_stack: Option<bool>,
 }
 
 /// Stack file name within the wt data directory.
@@ -385,6 +392,26 @@ fn write_stack_file(repo: &Repository, tree: &DependencyTree) -> anyhow::Result<
     Ok(())
 }
 
+/// Whether `branch` contains any of `parent`'s own commits (those not on
+/// `root`). A parent with no commits beyond `root` counts as built on.
+///
+/// Used to flag a declared parent the history disagrees with: the branch was
+/// never stacked on it. A branch merely behind its parent still builds on it.
+fn builds_on(repo: &Repository, branch: &str, parent: &str, root: &str) -> anyhow::Result<bool> {
+    if repo.count_commits(root, parent)? == 0 {
+        return Ok(true);
+    }
+    let (Some(with_parent), Some(with_root)) = (
+        repo.merge_base(branch, parent)?,
+        repo.merge_base(branch, root)?,
+    ) else {
+        return Ok(false);
+    };
+    // The branch shares nothing with the parent beyond what it shares with
+    // the root: none of the parent's own commits are in it.
+    Ok(!repo.is_ancestor_by_sha(&with_parent, &with_root)?)
+}
+
 /// Build the dependency tree from worktree branches.
 ///
 /// For each branch B, finds the closest parent P where merge_base(P, B) is
@@ -392,9 +419,11 @@ fn write_stack_file(repo: &Repository, tree: &DependencyTree) -> anyhow::Result<
 /// and their children reparented.
 ///
 /// Branches listed in the stack file (`.git/wt/stack`) keep their recorded
-/// parent; the rest are placed by merge-base inference.
+/// parent; the rest are placed by merge-base inference. Parents declared in
+/// gh-stack (`gh_stack_parents`) override both.
 fn build_dependency_tree(
     repo: &Repository,
+    gh_stack_parents: Option<&HashMap<String, String>>,
 ) -> anyhow::Result<(DependencyTree, Vec<IntegratedBranch>)> {
     let default_branch = repo
         .default_branch()
@@ -442,13 +471,46 @@ fn build_dependency_tree(
 
     // Parse stack file once (used for parent detection, integration checks, and reparenting)
     let stack_file_path = repo.wt_dir().join(STACK_FILE);
-    let explicit_parents: HashMap<String, String> = if stack_file_path.exists() {
+    let mut explicit_parents: HashMap<String, String> = if stack_file_path.exists() {
         let content =
             std::fs::read_to_string(&stack_file_path).context("Failed to read stack file")?;
         parse_stack_file(&content, &default_branch)?
     } else {
         HashMap::new()
     };
+
+    // Parents declared in gh-stack beat the stack file and inference, but only
+    // for worktree branches, and only when the declared parent is one too.
+    let mut gh_stack_branches: HashSet<String> = HashSet::new();
+    for (branch, parent) in gh_stack_parents.into_iter().flatten() {
+        if !local_branches.contains(branch.as_str()) {
+            continue;
+        }
+        if !local_branches.contains(parent.as_str()) {
+            eprintln!(
+                "{}",
+                warning_message(cformat!(
+                    "gh-stack declares <bold>{}</> as the parent of <bold>{}</>, but it has no worktree. Ignoring it.",
+                    parent,
+                    branch,
+                ))
+            );
+            continue;
+        }
+        if parent != &default_branch && !builds_on(repo, branch, parent, &default_branch)? {
+            eprintln!(
+                "{}",
+                warning_message(cformat!(
+                    "gh-stack declares <bold>{}</> as the parent of <bold>{}</>, but <bold>{}</> has none of its commits. Rebasing onto it anyway.",
+                    parent,
+                    branch,
+                    branch,
+                ))
+            );
+        }
+        explicit_parents.insert(branch.clone(), parent.clone());
+        gh_stack_branches.insert(branch.clone());
+    }
     let has_stack_file = !explicit_parents.is_empty();
 
     // Phase 1: Check integration against default branch (always)
@@ -658,6 +720,7 @@ fn build_dependency_tree(
         DependencyTree {
             root: default_branch,
             nodes,
+            gh_stack: gh_stack_branches,
         },
         integrated_list,
     ))
@@ -827,6 +890,50 @@ fn fast_forward_root(repo: &Repository, upstream: &str, worktree: &Path) -> anyh
 }
 
 /// Execute the sync operation.
+/// Parents declared in gh-stack, when they apply to this run.
+///
+/// Refuses to run while a gh-stack rebase or modify is paused, since its
+/// branches are mid-rewrite. The catalog is checked before gh-stack's
+/// installation, so repos that never used gh-stack pay for one `stat`.
+fn gh_stack_parents(
+    repo: &Repository,
+    opts: &SyncOptions,
+) -> anyhow::Result<Option<HashMap<String, String>>> {
+    if opts.gh_stack == Some(false) {
+        return Ok(None);
+    }
+    if opts.gh_stack == Some(true) && !gh_stack::is_installed() {
+        bail!("gh-stack is not installed: gh extension install github/gh-stack");
+    }
+    let common_dir = repo.git_common_dir();
+    if let Some(op) = gh_stack::paused_operation(common_dir) {
+        bail!(
+            "A gh-stack {op} is paused. Finish it with `gh stack {op} --continue` or `gh stack {op} --abort` first, or pass --no-gh-stack."
+        );
+    }
+    match gh_stack::read_catalog(common_dir) {
+        Catalog::Absent => Ok(None),
+        Catalog::Unsupported(why) => {
+            if opts.verbose {
+                eprintln!("{}", hint_message(format!("Ignoring gh-stack: {why}")));
+            }
+            Ok(None)
+        }
+        Catalog::Parents(parents) => {
+            if opts.gh_stack.is_none() && !gh_stack::is_installed() {
+                if opts.verbose {
+                    eprintln!(
+                        "{}",
+                        hint_message("Ignoring gh-stack's stacks: gh-stack is not installed")
+                    );
+                }
+                return Ok(None);
+            }
+            Ok(Some(parents))
+        }
+    }
+}
+
 pub fn handle_sync(opts: SyncOptions) -> anyhow::Result<()> {
     let repo = Repository::current()?;
 
@@ -840,6 +947,10 @@ pub fn handle_sync(opts: SyncOptions) -> anyhow::Result<()> {
         bail!("Default branch '{default_branch}' has no worktree. Cannot build dependency tree.");
     };
 
+    // Before anything moves: gh-stack may be paused mid-rebase, and its
+    // declared parents feed the tree below.
+    let gh_stack_parents = gh_stack_parents(&repo, &opts)?;
+
     // Fetch from remote if requested (skip in dry-run)
     if opts.fetch && !opts.dry_run {
         eprintln!("{}", progress_message(cformat!("Fetching from remote...")));
@@ -852,7 +963,7 @@ pub fn handle_sync(opts: SyncOptions) -> anyhow::Result<()> {
     let pending_ff = update_root(&repo, &default_branch, &root_worktree, &opts)?;
 
     // Build dependency tree
-    let (tree, integrated) = build_dependency_tree(&repo)?;
+    let (tree, integrated) = build_dependency_tree(&repo, gh_stack_parents.as_ref())?;
 
     // Determine which branches to sync
     let current_wt = repo.current_worktree();
@@ -1374,12 +1485,17 @@ fn print_tree_node(
     is_last: bool,
     is_root: bool,
 ) {
+    let source = if tree.gh_stack.contains(branch) {
+        " (gh-stack)"
+    } else {
+        ""
+    };
     if is_root {
         eprintln!("{branch}");
     } else if is_last {
-        eprintln!("{prefix}└── {branch}");
+        eprintln!("{prefix}└── {branch}{source}");
     } else {
-        eprintln!("{prefix}├── {branch}");
+        eprintln!("{prefix}├── {branch}{source}");
     }
 
     let Some(node) = tree.nodes.get(branch) else {
@@ -1451,6 +1567,7 @@ mod tests {
         let tree = DependencyTree {
             root: "main".to_string(),
             nodes,
+            gh_stack: HashSet::new(),
         };
 
         assert_eq!(tree.topological_order(), vec!["pr1", "pr2", "pr3"]);
@@ -1493,6 +1610,7 @@ mod tests {
         let tree = DependencyTree {
             root: "main".to_string(),
             nodes,
+            gh_stack: HashSet::new(),
         };
 
         let order = tree.topological_order();
@@ -1559,6 +1677,7 @@ mod tests {
         let tree = DependencyTree {
             root: "main".to_string(),
             nodes,
+            gh_stack: HashSet::new(),
         };
 
         // When on pr2, should get pr1, pr2, pr3 (the pr1 stack) but not feature-x
@@ -1657,6 +1776,7 @@ mod tests {
         DependencyTree {
             root: branches[0].0.to_string(),
             nodes,
+            gh_stack: HashSet::new(),
         }
     }
 

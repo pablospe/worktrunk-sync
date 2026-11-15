@@ -81,6 +81,18 @@ struct Cli {
     /// Preview the sync plan without executing
     #[arg(short = 'n', long)]
     dry_run: bool,
+
+    /// Use stacks declared in gh-stack (error if it isn't installed)
+    ///
+    /// By default, when the `gh stack` extension is installed and has stacks
+    /// in this clone, their declared parents are used for those branches
+    /// instead of the inferred ones.
+    #[arg(long = "gh-stack", overrides_with = "no_gh_stack", hide = true)]
+    gh_stack: bool,
+
+    /// Ignore gh-stack: infer every parent from git history
+    #[arg(long = "no-gh-stack", overrides_with = "gh_stack")]
+    no_gh_stack: bool,
 }
 
 fn flag_pair(positive: bool, negative: bool) -> Option<bool> {
@@ -120,6 +132,7 @@ fn main() {
         force: args.force,
         verbose: args.verbose,
         dry_run: args.dry_run,
+        gh_stack: flag_pair(args.gh_stack, args.no_gh_stack),
     };
 
     if let Err(e) = sync::handle_sync(opts) {

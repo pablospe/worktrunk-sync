@@ -4535,6 +4535,8 @@ dependencies = [
  "clap_complete",
  "color-print",
  "criterion",
+ "serde",
+ "serde_json",
  "tempfile",
  "worktrunk",
 ]
