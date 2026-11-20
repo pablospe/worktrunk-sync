@@ -142,6 +142,9 @@ fn branch_with_merge_commits_is_not_flattened() {
     write_commit(&repo, "base.txt", "base");
     let a = add_worktree(&repo, "a", "main");
     write_commit(&a, "a.txt", "a");
+    // A second commit on a makes it integration's clear parent; with one
+    // commit each, a and b tie and either may be picked.
+    write_commit(&a, "a2.txt", "a2");
     let b = add_worktree(&repo, "b", "main");
     write_commit(&b, "b.txt", "b");
     let integration = add_worktree(&repo, "integration", "a");

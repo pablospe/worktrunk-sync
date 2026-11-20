@@ -62,6 +62,15 @@ struct Cli {
     #[arg(long, conflicts_with_all = ["fetch", "pull", "push", "no_push", "prune", "force"])]
     push_only: bool,
 
+    /// Also push branches that were never pushed, setting their upstream
+    ///
+    /// Implies `--push` (unless `--push-only` is given). Each new branch goes
+    /// to the remote its parent pushes to, else `remote.pushDefault`, else
+    /// `origin`, with `git push -u`. Without this, branches with no upstream
+    /// are listed and left local.
+    #[arg(long, conflicts_with = "no_push")]
+    publish: bool,
+
     /// Remove integrated worktrees after syncing
     #[arg(short = 'P', long, overrides_with = "no_prune")]
     prune: bool,
@@ -109,7 +118,7 @@ struct Cli {
         require_equals = true,
         default_missing_value = "print",
         value_name = "MODE",
-        conflicts_with_all = ["fetch", "pull", "push", "push_only", "prune", "no_gh_stack"]
+        conflicts_with_all = ["fetch", "pull", "push", "push_only", "publish", "prune", "no_gh_stack"]
     )]
     gh_stack_init: Option<GhStackInitArg>,
 }
@@ -153,8 +162,10 @@ fn main() {
         fetch: flag_pair(args.fetch, args.no_fetch).unwrap_or(false) || pull,
         pull,
         all,
-        push: flag_pair(args.push, args.no_push).unwrap_or(false),
+        push: flag_pair(args.push, args.no_push).unwrap_or(false)
+            || (args.publish && !args.push_only),
         push_only: args.push_only,
+        publish: args.publish,
         prune: flag_pair(args.prune, args.no_prune).unwrap_or(false),
         force: args.force,
         verbose: args.verbose,
