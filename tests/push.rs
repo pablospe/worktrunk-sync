@@ -228,8 +228,11 @@ fn publish_pushes_new_branches_to_the_stack_remote_not_the_forks_upstream() {
             format!("origin/{branch}")
         );
     }
-    let upstream_heads = git(&root.join("upstream.git"), &["branch", "--list"]);
-    assert_eq!(upstream_heads, "* main", "published to upstream");
+    let upstream_heads = git(
+        &root.join("upstream.git"),
+        &["for-each-ref", "--format=%(refname:short)", "refs/heads"],
+    );
+    assert_eq!(upstream_heads, "main", "published to upstream");
 }
 
 #[test]
