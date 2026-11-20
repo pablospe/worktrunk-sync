@@ -376,7 +376,7 @@ where
             });
         }
 
-        if let Some(pick) = select_parent(branch, &ranked, history)? {
+        if let Some(pick) = select_parent(branch, &ranked, default_branch, history)? {
             record_pick(branch, pick, &mut parents, &mut equidistant);
         }
     }
@@ -537,7 +537,9 @@ struct ParentPick {
 /// shares a fork point. It also means a sibling forked from the parent's tip
 /// (same `branch_depth`, same merge-base commit) cannot steal the child on list
 /// order; only `candidate_depth == 0` keeps the parent. Equal ranks keep the
-/// candidate whose merge-base committer timestamp is newest.
+/// candidate whose merge-base committer timestamp is newest; if that ties
+/// too, the default branch, then the first name alphabetically, so the same
+/// repo always gets the same pick whatever order the branches were listed in.
 ///
 /// A diverged candidate still joins tier 1 when its reflog shows it was built
 /// on by the branch (see [`moved_on_parents`]): the branch was started from
@@ -545,6 +547,7 @@ struct ParentPick {
 fn select_parent<H: History>(
     branch: &str,
     ranked: &[RankedParent],
+    default_branch: &str,
     history: &H,
 ) -> Result<Option<ParentPick>> {
     let promoted = moved_on_parents(branch, ranked, history)?;
@@ -574,29 +577,37 @@ fn select_parent<H: History>(
         return Ok(None);
     };
 
-    let mut parent = ties[0].name.clone();
     if ties.len() == 1 {
         return Ok(Some(ParentPick {
-            parent,
+            parent: ties[0].name.clone(),
             equidistant: Vec::new(),
         }));
     }
 
     let mb_shas: Vec<&str> = ties.iter().map(|t| t.merge_base.as_str()).collect();
     let commits = history.commit_details_many(&mb_shas)?;
-    let mut best_ts = i64::MIN;
-    for t in &ties {
-        if let Some(&(_, ts, _)) = commits.get(t.merge_base.as_str()) {
-            if ts > best_ts {
-                best_ts = ts;
-                parent = t.name.clone();
-            }
-        }
-    }
+    let timestamp = |t: &RankedParent| {
+        commits
+            .get(t.merge_base.as_str())
+            .map_or(i64::MIN, |&(_, ts, _)| ts)
+    };
+    let parent = ties
+        .iter()
+        .max_by_key(|t| {
+            (
+                timestamp(t),
+                t.name == default_branch,
+                std::cmp::Reverse(t.name.as_str()),
+            )
+        })
+        .map(|t| t.name.clone())
+        .expect("ties is not empty");
 
+    let mut equidistant: Vec<String> = ties.iter().map(|t| t.name.clone()).collect();
+    equidistant.sort();
     Ok(Some(ParentPick {
         parent,
-        equidistant: ties.iter().map(|t| t.name.clone()).collect(),
+        equidistant,
     }))
 }
 
@@ -991,6 +1002,49 @@ mod tests {
             "commit failed: {}",
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+
+    #[test]
+    fn full_tie_is_picked_the_same_whatever_the_branch_order() {
+        // integration merges a and b, which forked off main with the same
+        // timestamp: equally close, same-second merge-bases.
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo);
+        let date = "2020-01-01T00:00:00 +0000";
+        commit_dated(&repo, "main.txt", "main", date);
+        git(&repo, &["checkout", "-b", "b"]);
+        commit_dated(&repo, "b.txt", "b", date);
+        git(&repo, &["checkout", "main"]);
+        git(&repo, &["checkout", "-b", "a"]);
+        commit_dated(&repo, "a.txt", "a", date);
+        git(&repo, &["checkout", "-b", "integration"]);
+        commit_dated(&repo, "i.txt", "i", date);
+        git(&repo, &["merge", "--no-ff", "--no-edit", "b"]);
+
+        let git_repo = Repository::at(&repo).unwrap();
+        let skip = HashSet::new();
+        for branches in [
+            ["main", "a", "b", "integration"],
+            ["main", "b", "a", "integration"],
+            ["integration", "b", "a", "main"],
+        ] {
+            let inferred =
+                infer_parents(&git_repo, &branches, "main", &skip, MemoryBudget::default())
+                    .unwrap();
+            assert_eq!(
+                inferred.parents.get("integration").map(String::as_str),
+                Some("a"),
+                "order {branches:?}"
+            );
+            let tie = inferred
+                .equidistant
+                .iter()
+                .find(|e| e.branch == "integration")
+                .expect("integration's tie is reported");
+            assert_eq!(tie.candidates, ["a", "b"], "order {branches:?}");
+        }
     }
 
     #[test]
