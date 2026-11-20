@@ -160,6 +160,8 @@ pub struct SyncOptions {
     pub push: bool,
     /// Push the selected branches as-is, skipping fetch and rebase.
     pub push_only: bool,
+    /// Also push branches without an upstream, with `git push -u`.
+    pub publish: bool,
     pub prune: bool,
     pub force: bool,
     pub verbose: bool,
@@ -1201,7 +1203,7 @@ pub fn handle_sync(opts: SyncOptions) -> anyhow::Result<()> {
 
     // Push-only mode: no rebase, so no worktree safety checks or state updates
     if opts.push_only {
-        let (attempted, failed) = push_branches(&repo, &branches_to_sync);
+        let (attempted, failed) = push_branches(&repo, &tree, &branches_to_sync, opts.publish);
         if attempted == 0 {
             eprintln!(
                 "{}",
@@ -1405,7 +1407,7 @@ pub fn handle_sync(opts: SyncOptions) -> anyhow::Result<()> {
             .copied()
             .filter(|b| !conflicted.contains(b))
             .collect();
-        push_branches(&repo, &to_push);
+        push_branches(&repo, &tree, &to_push, opts.publish);
     }
 
     // Prune integrated worktrees
@@ -1644,6 +1646,8 @@ struct PushTarget {
     remote: String,
     /// Branch name on the remote (differs only with `push.default=upstream`).
     remote_branch: String,
+    /// The branch has no upstream yet: push with `-u` to set one (`--publish`).
+    publish: bool,
 }
 
 impl PushTarget {
@@ -1654,25 +1658,51 @@ impl PushTarget {
             format!("{}:{}", self.branch, self.remote_branch)
         }
     }
+
+    fn args(&self) -> Vec<String> {
+        let mut args = vec!["push".to_string()];
+        // A new branch gets a plain push: it fails rather than overwrite a
+        // remote branch of the same name that we never fetched.
+        args.push(
+            if self.publish {
+                "-u"
+            } else {
+                "--force-with-lease"
+            }
+            .to_string(),
+        );
+        args.push(self.remote.clone());
+        args.push(self.refspec());
+        args
+    }
 }
 
-/// Branches to push, and a note for each branch with an upstream that is
-/// left alone.
+/// Branches to push, and a note for each branch that is left alone.
 ///
 /// The destination is git's own `@{push}`, so `wt sync -p` pushes exactly
 /// where `git push` would, and refuses where it would. A branch tracking
 /// another branch (say `upstream/main`, a repo you may not own) has no push
 /// destination under `push.default=simple` and is skipped, not force-pushed
-/// to its upstream's remote. Branches without an upstream are skipped
-/// silently, as before.
-fn push_targets(repo: &Repository, branches: &[&str]) -> (Vec<PushTarget>, Vec<String>) {
-    let refs: Vec<String> = branches.iter().map(|b| format!("refs/heads/{b}")).collect();
-    let mut args = vec![
-        "for-each-ref",
-        "--format=%(refname:strip=2)%00%(upstream:short)%00%(push)%00%(push:remotename)",
-    ];
-    args.extend(refs.iter().map(String::as_str));
-    let output = repo.run_command(&args).unwrap_or_default();
+/// to its upstream's remote.
+///
+/// A branch without an upstream is published only with `--publish`, to
+/// [`publish_remote`]; otherwise the note lists it so it isn't mistaken for
+/// pushed.
+fn push_targets(
+    repo: &Repository,
+    tree: &DependencyTree,
+    branches: &[&str],
+    publish: bool,
+) -> (Vec<PushTarget>, Vec<String>) {
+    // Every local branch, not only `branches`: a new branch's remote comes
+    // from its parent, which may not be pushed in this run.
+    let output = repo
+        .run_command(&[
+            "for-each-ref",
+            "--format=%(refname:strip=2)%00%(upstream:short)%00%(push)%00%(push:remotename)",
+            "refs/heads",
+        ])
+        .unwrap_or_default();
     let mut found: HashMap<&str, (&str, &str, &str)> = HashMap::new();
     for line in output.lines() {
         let fields: Vec<&str> = line.split('\0').collect();
@@ -1680,35 +1710,109 @@ fn push_targets(repo: &Repository, branches: &[&str]) -> (Vec<PushTarget>, Vec<S
             found.insert(branch, (upstream, push, remote));
         }
     }
+    let push_remote = |branch: &str| -> Option<(String, String)> {
+        let &(upstream, push, remote) = found.get(branch)?;
+        if upstream.is_empty() || remote.is_empty() {
+            return None;
+        }
+        let remote_branch = push.strip_prefix(&format!("refs/remotes/{remote}/"))?;
+        Some((remote.to_string(), remote_branch.to_string()))
+    };
 
     let mut targets = Vec::new();
     let mut skipped = Vec::new();
+    let mut unpublished = Vec::new();
     for &branch in branches {
-        let Some(&(upstream, push, remote)) = found.get(branch) else {
+        let Some(&(upstream, _, _)) = found.get(branch) else {
             continue;
         };
         if upstream.is_empty() {
+            if !publish {
+                unpublished.push(branch);
+                continue;
+            }
+            match publish_remote(repo, tree, branch, &push_remote) {
+                Some(remote) => targets.push(PushTarget {
+                    branch: branch.to_string(),
+                    remote,
+                    remote_branch: branch.to_string(),
+                    publish: true,
+                }),
+                None => skipped.push(format!(
+                    "Not publishing {branch}: no remote to publish it to. Add one with `git remote add origin <url>`."
+                )),
+            }
             continue;
         }
-        let remote_branch = push
-            .strip_prefix(&format!("refs/remotes/{remote}/"))
-            .filter(|_| !remote.is_empty());
-        match remote_branch {
-            Some(remote_branch) => targets.push(PushTarget {
+        match push_remote(branch) {
+            Some((remote, remote_branch)) => targets.push(PushTarget {
                 branch: branch.to_string(),
-                remote: remote.to_string(),
-                remote_branch: remote_branch.to_string(),
+                remote,
+                remote_branch,
+                publish: false,
             }),
             None => skipped.push(format!(
                 "Not pushing {branch}: it tracks {upstream}, so git has no single place to push it. Push it once with `git push -u <remote> {branch}` to choose one."
             )),
         }
     }
+    if !unpublished.is_empty() {
+        let (these, them) = if unpublished.len() == 1 {
+            ("it has", "it")
+        } else {
+            ("they have", "them")
+        };
+        skipped.push(format!(
+            "Not pushing {}: {these} no upstream yet. Publish {them} with `wt sync --publish`.",
+            unpublished.join(", ")
+        ));
+    }
     (targets, skipped)
 }
 
-fn push_branches(repo: &Repository, branches: &[&str]) -> (usize, usize) {
-    let (targets, skipped) = push_targets(repo, branches);
+/// The remote a branch without an upstream is published to.
+///
+/// The nearest ancestor in the stack that is pushed somewhere decides, so a
+/// new branch follows the stack it sits on. The root doesn't count: in a fork
+/// it usually tracks the original repo, which is not where your branches go.
+/// Failing that: `remote.pushDefault`, then `origin`, then the only remote.
+fn publish_remote(
+    repo: &Repository,
+    tree: &DependencyTree,
+    branch: &str,
+    push_remote: &dyn Fn(&str) -> Option<(String, String)>,
+) -> Option<String> {
+    let mut parent = tree.nodes.get(branch).and_then(|n| n.parent.as_deref());
+    while let Some(p) = parent.filter(|p| *p != tree.root) {
+        if let Some((remote, _)) = push_remote(p) {
+            return Some(remote);
+        }
+        parent = tree.nodes.get(p).and_then(|n| n.parent.as_deref());
+    }
+    if let Ok(remote) = repo.run_command(&["config", "remote.pushDefault"]) {
+        let remote = remote.trim();
+        if !remote.is_empty() {
+            return Some(remote.to_string());
+        }
+    }
+    let remotes = repo.run_command(&["remote"]).unwrap_or_default();
+    let remotes: Vec<&str> = remotes.lines().map(str::trim).collect();
+    if remotes.contains(&"origin") {
+        return Some("origin".to_string());
+    }
+    match remotes[..] {
+        [only] => Some(only.to_string()),
+        _ => None,
+    }
+}
+
+fn push_branches(
+    repo: &Repository,
+    tree: &DependencyTree,
+    branches: &[&str],
+    publish: bool,
+) -> (usize, usize) {
+    let (targets, skipped) = push_targets(repo, tree, branches, publish);
     let mut failed = 0;
     if !targets.is_empty() || !skipped.is_empty() {
         eprintln!();
@@ -1718,15 +1822,25 @@ fn push_branches(repo: &Repository, branches: &[&str]) -> (usize, usize) {
     }
     for target in &targets {
         let PushTarget { branch, remote, .. } = target;
+        let verb = if target.publish {
+            "Publishing"
+        } else {
+            "Pushing"
+        };
         eprintln!(
             "{}",
-            progress_message(cformat!("Pushing <bold>{branch}</> to {remote}..."))
+            progress_message(cformat!("{verb} <bold>{branch}</> to {remote}..."))
         );
-        let refspec = target.refspec();
-        let result = repo.run_command(&["push", "--force-with-lease", remote, &refspec]);
-        match result {
+        let args = target.args();
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        match repo.run_command(&args) {
             Ok(_) => {
-                eprintln!("{}", success_message(cformat!("Pushed <bold>{branch}</>")));
+                let done = if target.publish {
+                    "Published"
+                } else {
+                    "Pushed"
+                };
+                eprintln!("{}", success_message(cformat!("{done} <bold>{branch}</>")));
             }
             Err(e) => {
                 failed += 1;
@@ -1768,7 +1882,7 @@ fn print_sync_plan(
     eprintln!("Planned operations:");
 
     if opts.push_only {
-        let (targets, skipped) = push_targets(repo, branches);
+        let (targets, skipped) = push_targets(repo, tree, branches, opts.publish);
         if targets.is_empty() {
             eprintln!("  (none)");
         }
@@ -1883,7 +1997,7 @@ fn print_sync_plan(
             .copied()
             .filter(|b| !conflicted.contains(b))
             .collect();
-        let (targets, skipped) = push_targets(repo, &to_push);
+        let (targets, skipped) = push_targets(repo, tree, &to_push, opts.publish);
         if !targets.is_empty() || !skipped.is_empty() {
             eprintln!();
             eprintln!("Push:");
@@ -1942,13 +2056,10 @@ fn print_sync_plan(
 
 fn print_push_plan(targets: &[PushTarget], skipped: &[String], verbose: bool) {
     for target in targets {
-        eprintln!("  push {} to {}", target.branch, target.remote);
+        let verb = if target.publish { "publish" } else { "push" };
+        eprintln!("  {verb} {} to {}", target.branch, target.remote);
         if verbose {
-            eprintln!(
-                "    $ git push --force-with-lease {} {}",
-                target.remote,
-                target.refspec()
-            );
+            eprintln!("    $ git {}", target.args().join(" "));
         }
     }
     for why in skipped {

@@ -84,7 +84,18 @@ wt sync --push-only        # current stack
 wt sync --push-only --all  # every stack
 ```
 
-Pushes each branch in the selected scope as-is (`git push --force-with-lease`), in dependency order, without fetching or rebasing. Branches without an upstream are skipped, just like with `--push`. Worktrees don't need to be clean, and the stack/fork-point files are left untouched. Exits non-zero if any push fails. Run from the default branch's worktree, the "current stack" is every stack, so all branches are pushed. Combine with `-nv` to preview the push commands. Cannot be combined with `--push`, `--fetch` or `--prune`.
+Pushes each branch in the selected scope as-is (`git push --force-with-lease`), in dependency order, without fetching or rebasing. Branches without an upstream are skipped and listed, just like with `--push`; add `--publish` to push them too. Worktrees don't need to be clean, and the stack/fork-point files are left untouched. Exits non-zero if any push fails. Run from the default branch's worktree, the "current stack" is every stack, so all branches are pushed. Combine with `-nv` to preview the push commands. Cannot be combined with `--push`, `--fetch` or `--prune`.
+
+### Publishing new branches
+
+`--push` only pushes branches that already have an upstream, so a branch you never pushed stays local, and the output lists it ("Not pushing b, c: they have no upstream yet"). To push those too:
+
+```bash
+wt sync --publish     # rebase, then push, and publish branches with no upstream
+wt sync -n --publish  # see where each new branch would go
+```
+
+`--publish` implies `--push` (or combine it with `--push-only`). Each new branch is pushed with `git push -u`, which sets its upstream, to the remote its nearest pushed parent uses. If none of the branches it sits on is pushed, it goes to `remote.pushDefault`, then `origin`, then the only remote. The root branch is never used to pick the remote, because in a fork `main` usually tracks the original repo, and your branches don't belong there.
 
 ### gh-stack
 
@@ -113,6 +124,7 @@ This only registers the stacks; nothing is rebased or pushed. gh-stack stacks ar
 | `--pull` | `-u` | Fetch, then fast-forward the root branch to its upstream (implies `--fetch`) |
 | `--push` | `-p` | Push rebased branches after syncing |
 | `--push-only` | | Push the stack as-is, without fetching or rebasing |
+| `--publish` | | Also push branches with no upstream yet (`git push -u`), see [Publishing new branches](#publishing-new-branches) |
 | `--prune` | `-P` | Remove integrated worktrees after syncing |
 | `--force` | `-F` | Force removal of dirty integrated worktrees (with `--prune`) |
 | `--verbose` | `-v` | Show git commands that would be executed |

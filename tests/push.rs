@@ -140,3 +140,112 @@ fn branch_whose_remote_branch_was_deleted_is_still_pushed() {
     let out = wt_sync(&repo, &["--all", "--push"]);
     assert!(out.contains("Pushed a"), "{out}");
 }
+
+/// A fork: main tracks upstream/main, a is pushed to origin, b (on a) and c
+/// (on main) were never pushed.
+fn fork_with_unpushed_branches(root: &Path) -> std::path::PathBuf {
+    git(root, &["init", "-q", "--bare", "origin.git"]);
+    git(root, &["init", "-q", "--bare", "upstream.git"]);
+    let repo = root.join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "-b", "main"]);
+    git(&repo, &["config", "push.default", "simple"]);
+    commit_file(&repo, "initial.txt");
+    git(&repo, &["remote", "add", "origin", "../origin.git"]);
+    git(&repo, &["remote", "add", "upstream", "../upstream.git"]);
+    git(&repo, &["push", "-q", "origin", "main"]);
+    git(&repo, &["push", "-q", "-u", "upstream", "main"]);
+
+    let add = |name: &str, base: &str| {
+        let dir = root.join(format!("wt-{name}"));
+        git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                name,
+                &dir.to_string_lossy(),
+                base,
+            ],
+        );
+        commit_file(&dir, &format!("{name}.txt"));
+        dir
+    };
+    let a = add("a", "main");
+    git(&a, &["push", "-q", "-u", "origin", "a"]);
+    add("b", "a");
+    add("c", "main");
+    repo
+}
+
+#[test]
+fn push_names_the_branches_it_leaves_local() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = fork_with_unpushed_branches(tmp.path());
+
+    let plan = wt_sync(&repo, &["--all", "--push", "-n"]);
+    assert!(plan.contains("push a to origin"), "{plan}");
+    assert!(plan.contains("no upstream yet"), "{plan}");
+    assert!(plan.contains("wt sync --publish"), "{plan}");
+
+    let out = wt_sync(&repo, &["--all", "--push"]);
+    assert!(out.contains("Pushed a"), "{out}");
+    assert!(out.contains("no upstream yet"), "{out}");
+    let heads = git(&tmp.path().join("origin.git"), &["branch", "--list"]);
+    assert!(!heads.contains('b') && !heads.contains('c'), "{heads}");
+}
+
+#[test]
+fn publish_pushes_new_branches_to_the_stack_remote_not_the_forks_upstream() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let repo = fork_with_unpushed_branches(root);
+
+    let plan = wt_sync(&repo, &["--all", "--publish", "-n", "-v"]);
+    assert!(plan.contains("publish b to origin"), "{plan}");
+    assert!(plan.contains("$ git push -u origin b"), "{plan}");
+    assert!(plan.contains("publish c to origin"), "{plan}");
+
+    let out = wt_sync(&repo, &["--all", "--publish"]);
+    assert!(out.contains("Published b"), "{out}");
+    assert!(out.contains("Published c"), "{out}");
+    for branch in ["b", "c"] {
+        assert_eq!(
+            git(&root.join("origin.git"), &["rev-parse", branch]),
+            git(&repo, &["rev-parse", branch])
+        );
+        assert_eq!(
+            git(
+                &repo,
+                &[
+                    "rev-parse",
+                    "--abbrev-ref",
+                    &format!("{branch}@{{upstream}}")
+                ]
+            ),
+            format!("origin/{branch}")
+        );
+    }
+    let upstream_heads = git(
+        &root.join("upstream.git"),
+        &["for-each-ref", "--format=%(refname:short)", "refs/heads"],
+    );
+    assert_eq!(upstream_heads, "main", "published to upstream");
+}
+
+#[test]
+fn publish_follows_the_parents_remote() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let repo = fork_with_unpushed_branches(root);
+    // a lives on a third remote: b, stacked on it, goes there too.
+    git(root, &["init", "-q", "--bare", "team.git"]);
+    git(&repo, &["remote", "add", "team", "../team.git"]);
+    git(&root.join("wt-a"), &["push", "-q", "-u", "team", "a"]);
+
+    let plan = wt_sync(&repo, &["--all", "--publish", "-n"]);
+    assert!(plan.contains("publish b to team"), "{plan}");
+    assert!(plan.contains("publish c to origin"), "{plan}");
+}
